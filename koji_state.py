@@ -28,8 +28,13 @@ STATES: List[str] = [
 ]
 
 ASSET_DIR = ROOT_DIR / "assets" / "koji"
-ASSET_EXTENSIONS = ("webp", "gif", "png")
-PLACEHOLDER = "🐾\nKoji"
+ASSET_EXTENSIONS = ("png", "webp", "gif")
+PLACEHOLDER = "🐱\nKoji"
+PLACEHOLDER_STYLESHEET = (
+    "QLabel { color: #6b4b35; font-size: 28px; font-weight: 700; "
+    "background: rgba(255, 246, 225, 190); border: 2px solid rgba(107,75,53,90); "
+    "border-radius: 24px; padding: 8px; }"
+)
 
 
 def find_state_asset(state: str) -> Path | None:
@@ -61,17 +66,15 @@ class KojiVisual:
         self.label.setFixedSize(self.size)
 
         if asset is None:
-            self.label.setText(PLACEHOLDER)
-            self.label.setStyleSheet(
-                "QLabel { color: #6b4b35; font-size: 28px; font-weight: 700; "
-                "background: rgba(255, 246, 225, 190); border: 2px solid rgba(107,75,53,90); "
-                "border-radius: 24px; padding: 8px; }"
-            )
+            self._show_placeholder()
             return
 
         self.label.setStyleSheet("background: transparent;")
         if asset.suffix.lower() == ".gif":
             self.movie = QMovie(str(asset))
+            if not self.movie.isValid():
+                self._show_placeholder()
+                return
             self.movie.setScaledSize(self.size)
             self.label.setMovie(self.movie)
             self.movie.start()
@@ -79,9 +82,13 @@ class KojiVisual:
 
         pixmap = QPixmap(str(asset))
         if pixmap.isNull():
-            self.label.setText(PLACEHOLDER)
+            self._show_placeholder()
             return
         self.label.setPixmap(pixmap.scaled(self.size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _show_placeholder(self) -> None:
+        self.label.setText(PLACEHOLDER)
+        self.label.setStyleSheet(PLACEHOLDER_STYLESHEET)
 
 
 def load_dialogues() -> Dict[str, List[str]]:
