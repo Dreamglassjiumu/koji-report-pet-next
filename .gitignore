@@ -23,3 +23,11 @@ ai-runtime/*.zip
 data/records.json
 data/chat_history.json
 data/*.tmp
+*.7z
+*.rar
+*.exe
+*.gguf
+*.zip
+*.png
+*.gif
+*.webp

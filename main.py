@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ai_runtime_manager import AIRuntimeManager, AI_UNAVAILABLE_MESSAGE
+from ai_runtime_manager import AIRuntimeManager, AI_UNAVAILABLE_MESSAGE, READY_MESSAGE, STARTING_MESSAGE, STATUS_LABELS
 from chat_manager import ChatManager
 from koji_state import STATES, KojiVisual, random_dialogue
 from report_manager import CATEGORIES, ReportManager, format_record_line
@@ -127,11 +127,16 @@ class ChatDialog(QDialog):
         if not text:
             return
         self.input.clear()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "temporary_state"):
+            parent.temporary_state("thinking")  # type: ignore[attr-defined]
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            self.chat_manager.chat(text, unavailable_reply=CHAT_UNAVAILABLE_REPLY)
+            ok, answer = self.chat_manager.chat(text, unavailable_reply=CHAT_UNAVAILABLE_REPLY)
         finally:
             QApplication.restoreOverrideCursor()
+        if parent is not None and hasattr(parent, "temporary_state"):
+            parent.temporary_state("happy" if ok else "confused")  # type: ignore[attr-defined]
         self.refresh()
 
     def clear_history(self) -> None:
@@ -157,7 +162,7 @@ class ReportPanel(QDialog):
         self.state_callback = state_callback
         self.record_ids: Dict[int, str] = {}
         self.setWindowTitle("Koji 日报面板")
-        self.resize(780, 680)
+        self.resize(860, 760)
         self.setObjectName("reportPanel")
         self.setStyleSheet(REPORT_PANEL_STYLESHEET)
 
@@ -168,6 +173,24 @@ class ReportPanel(QDialog):
         self.ai_notice = QLabel("")
         self.ai_notice.setObjectName("aiNotice")
         self.ai_notice.setWordWrap(True)
+
+        self.ai_status_label = QLabel("")
+        self.ai_status_label.setObjectName("panelSubtitle")
+        restart_ai_button = QPushButton("重启 Koji 脑子")
+        restart_ai_button.clicked.connect(self.restart_ai)
+        close_ai_button = QPushButton("关闭智能模式")
+        close_ai_button.clicked.connect(self.close_ai)
+        check_ai_button = QPushButton("检查 AI 状态")
+        check_ai_button.clicked.connect(self.check_ai_status)
+        self.ai_detail = QLabel("")
+        self.ai_detail.setWordWrap(True)
+        self.ai_detail.setVisible(False)
+        detail_button = QPushButton("显示/隐藏高级信息")
+        detail_button.clicked.connect(lambda: self.ai_detail.setVisible(not self.ai_detail.isVisible()))
+        ai_status_row = QHBoxLayout()
+        ai_status_row.addWidget(self.ai_status_label, 1)
+        for button in (restart_ai_button, close_ai_button, check_ai_button, detail_button):
+            ai_status_row.addWidget(button)
         self.refresh_ai_notice()
 
         self.date_label = QLabel(f"日期：{date.today().isoformat()}")
@@ -218,6 +241,8 @@ class ReportPanel(QDialog):
         layout.addWidget(self.title_label)
         layout.addWidget(self.subtitle_label)
         layout.addWidget(self.ai_notice)
+        layout.addLayout(ai_status_row)
+        layout.addWidget(self.ai_detail)
         layout.addWidget(self.date_label)
         layout.addLayout(input_row)
         layout.addWidget(QLabel("今日记录："))
@@ -231,10 +256,49 @@ class ReportPanel(QDialog):
         if self.state_callback is not None:
             self.state_callback(state)
 
+    def show_koji_message(self, message: str) -> None:
+        self.ai_notice.setText(message)
+        self.ai_notice.setVisible(True)
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "bubble"):
+            parent.bubble.show_message(message, parent)  # type: ignore[attr-defined]
+
     def refresh_ai_notice(self) -> None:
-        ok, _ = self.ai_runtime.check_files()
-        self.ai_notice.setVisible(not ok)
-        self.ai_notice.setText(AI_UNAVAILABLE_MESSAGE if not ok else "")
+        status = self.ai_runtime.refresh_status()
+        message = self.ai_runtime.status_message()
+        self.ai_status_label.setText(f"Koji 智能模式：{STATUS_LABELS.get(status, '未知')}")
+        self.ai_notice.setVisible(status.value not in {"ready_to_start", "stopped", "ready"})
+        self.ai_notice.setText("" if status.value in {"ready_to_start", "stopped", "ready"} else message)
+        port_text = str(self.ai_runtime.port) if self.ai_runtime.port is not None else "未分配"
+        self.ai_detail.setText(
+            "高级信息：\n"
+            f"当前端口：{port_text}\n"
+            f"runtime 路径：{self.ai_runtime.server_path}\n"
+            f"model 路径：{self.ai_runtime.model_path}\n"
+            f"最近错误：{self.ai_runtime.last_error or '无'}"
+        )
+
+    def check_ai_status(self) -> None:
+        self.refresh_ai_notice()
+        self.show_koji_message(self.ai_runtime.status_message())
+
+    def restart_ai(self) -> None:
+        self.notify_state("thinking")
+        self.show_koji_message(STARTING_MESSAGE)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok, message = self.ai_runtime.restart()
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.refresh_ai_notice()
+        self.notify_state("success" if ok else "error")
+        self.show_koji_message(message)
+
+    def close_ai(self) -> None:
+        self.ai_runtime.shutdown()
+        self.notify_state("sleep")
+        self.refresh_ai_notice()
+        self.show_koji_message("智能模式已关闭，普通模板日报仍然可用。")
 
     def refresh_records(self) -> None:
         self.records_list.clear()
@@ -348,27 +412,42 @@ class ReportPanel(QDialog):
     def generate_ai(self) -> None:
         material = self.report_manager.ai_material_text()
         if not material.strip():
-            self.report_text.setPlainText("素材不足：请先添加今日记录。")
             self.notify_state("confused")
+            self.show_koji_message("还没有日报素材，先记录一点今天做了什么吧。")
             return
-        self.notify_state("writing")
         ok, check_message = self.ai_runtime.check_files()
         self.refresh_ai_notice()
         if not ok:
-            self.report_text.setPlainText(AI_UNAVAILABLE_MESSAGE)
             self.notify_state("confused")
+            self.show_koji_message(check_message)
             return
+        self.notify_state("thinking")
+        self.show_koji_message(STARTING_MESSAGE)
         messages = [
-            {"role": "system", "content": "你是专业中文日报助手。请根据素材整理一份简洁、清晰、可编辑的工作日报。"},
-            {"role": "user", "content": f"今天的素材如下：\n{material}\n\n请输出日报，包含今日完成和明日计划。"},
+            {
+                "role": "system",
+                "content": (
+                    "你是 Koji，一个文案组日报整理桌宠。你帮助游戏公司文案策划把零散记录整理成体面、真实、简洁的中文日报。"
+                    "不要编造没有提供的工作内容。不要写成客服腔，不要过度官话。默认输出结构：\n"
+                    "一、今日完成\n二、进行中\n三、明日计划\n四、风险与待确认\n"
+                    "如果素材不足，请明确提示“素材较少”，但仍基于已有素材整理一版可用日报。"
+                ),
+            },
+            {"role": "user", "content": f"今日记录素材：\n{material}"},
         ]
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            ok, answer = self.ai_runtime.chat(messages, temperature=0.4, max_tokens=900)
+            ok, answer = self.ai_runtime.chat(messages, temperature=0.4, max_tokens=1000)
         finally:
             QApplication.restoreOverrideCursor()
-        self.report_text.setPlainText(answer if ok else answer)
-        self.notify_state("happy" if ok else "error")
+        self.refresh_ai_notice()
+        if ok:
+            self.report_text.setPlainText(answer)
+            self.notify_state("happy")
+            self.show_koji_message("日报炼成完毕，去交差吧。")
+            return
+        self.notify_state("error")
+        self.show_koji_message(f"AI 整理日报失败：{answer}\n普通模板日报仍然可用，原始记录不会丢失。")
 
     def copy_report(self) -> None:
         text = self.report_text.toPlainText()
