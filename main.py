@@ -11,15 +11,19 @@ from typing import Callable, Dict
 if not os.environ.get("DISPLAY") and sys.platform.startswith("linux"):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QAbstractAnimation, QPoint, QSize, Qt, QTimer, QVariantAnimation
-from PySide6.QtGui import QAction, QGuiApplication
+from PySide6.QtCore import QAbstractAnimation, QPoint, QSize, Qt, QTime, QTimer, QVariantAnimation
+from PySide6.QtGui import QAction, QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
+    QFormLayout,
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QInputDialog,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -27,6 +31,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QSpinBox,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -34,7 +40,12 @@ from PySide6.QtWidgets import (
 from ai_runtime_manager import AIRuntimeManager, AI_UNAVAILABLE_MESSAGE, READY_MESSAGE, STARTING_MESSAGE, STATUS_LABELS
 from chat_manager import ChatManager
 from koji_state import STATES, KojiVisual, random_dialogue
-from report_manager import CATEGORIES, ReportManager, format_record_line
+from report_manager import CATEGORIES, ReportManager, clean_ai_report_text, format_record_line
+from hourly_chime_manager import HourlyChimeManager
+from notes_manager import Note, NotesManager
+from pomodoro_manager import PHASE_FOCUS, PomodoroManager
+from settings_manager import SettingsManager
+from tag_manager import TagManager
 
 
 REPORT_PANEL_STYLESHEET = """
@@ -432,7 +443,7 @@ class ReportPanel(QDialog):
             QApplication.restoreOverrideCursor()
         self.refresh_ai_notice()
         if ok:
-            self.report_text.setPlainText(answer)
+            self.report_text.setPlainText(clean_ai_report_text(answer))
             self.notify_state("happy")
             if record_count <= 1:
                 self.show_koji_message("素材有点少，但 Koji 已经努力给你缝成体面日报了。")
@@ -532,6 +543,409 @@ class DialogueBubble(QWidget):
             y = max(available.top() + 8, y)
         self.move(x, y)
 
+class PomodoroWindow(QDialog):
+    def __init__(self, manager: PomodoroManager, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.manager = manager
+        self.setWindowTitle("Koji 番茄钟")
+        self.setObjectName("reportPanel")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET)
+        self.resize(320, 220)
+
+        self.phase_label = QLabel()
+        self.phase_label.setObjectName("panelSubtitle")
+        self.time_label = QLabel()
+        self.time_label.setStyleSheet("font-size: 42px; font-weight: 900; color: #4b3324;")
+        self.count_label = QLabel()
+        self.count_label.setObjectName("panelSubtitle")
+
+        start_button = QPushButton("开始")
+        start_button.clicked.connect(self.manager.start)
+        pause_button = QPushButton("暂停/继续")
+        pause_button.clicked.connect(self.manager.toggle_pause)
+        stop_button = QPushButton("停止")
+        stop_button.clicked.connect(self.manager.stop)
+        skip_button = QPushButton("跳过")
+        skip_button.clicked.connect(self.manager.skip)
+        reset_button = QPushButton("重置计数")
+        reset_button.clicked.connect(self.manager.reset_count)
+
+        row = QHBoxLayout()
+        for button in (start_button, pause_button, stop_button, skip_button, reset_button):
+            row.addWidget(button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("番茄钟状态"))
+        layout.addWidget(self.phase_label)
+        layout.addWidget(self.time_label)
+        layout.addWidget(self.count_label)
+        layout.addLayout(row)
+        self.manager.tick.connect(self.refresh)
+        self.manager.phase_changed.connect(lambda _phase: self.refresh())
+        self.refresh()
+
+    def refresh(self) -> None:
+        running = "运行中" if self.manager.running else "已暂停" if self.manager.phase != "stopped" else "未开始"
+        self.phase_label.setText(f"当前阶段：{self.manager.phase_label()}（{running}）")
+        self.time_label.setText(self.manager.formatted_remaining())
+        self.count_label.setText(f"今日已完成番茄数：{self.manager.completed_today}")
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
+        self.hide()
+
+
+class TagManageDialog(QDialog):
+    def __init__(self, tag_manager: TagManager, notes_manager: NotesManager | None = None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.tag_manager = tag_manager
+        self.notes_manager = notes_manager
+        self.setWindowTitle("Tag 管理")
+        self.setObjectName("reportPanel")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET)
+        self.resize(430, 420)
+        self.list_widget = QListWidget()
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self.rename_selected())
+        add_button = QPushButton("新增 Tag")
+        add_button.clicked.connect(self.add_tag)
+        rename_button = QPushButton("重命名")
+        rename_button.clicked.connect(self.rename_selected)
+        color_button = QPushButton("修改颜色")
+        color_button.clicked.connect(self.change_color)
+        delete_button = QPushButton("删除")
+        delete_button.clicked.connect(self.delete_selected)
+        restore_button = QPushButton("恢复默认")
+        restore_button.clicked.connect(self.restore_defaults)
+        row = QHBoxLayout()
+        for button in (add_button, rename_button, color_button, delete_button, restore_button):
+            row.addWidget(button)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("便签 Tag：双击可重命名，删除后便签会变为未分类。"))
+        layout.addWidget(self.list_widget, 1)
+        layout.addLayout(row)
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.list_widget.clear()
+        for tag in self.tag_manager.all_tags():
+            item = QListWidgetItem(f"{tag.name}  {tag.color}")
+            item.setData(Qt.UserRole, tag.id)
+            item.setBackground(QColor(tag.color))
+            self.list_widget.addItem(item)
+
+    def selected_tag_id(self) -> str | None:
+        item = self.list_widget.currentItem()
+        return str(item.data(Qt.UserRole)) if item is not None else None
+
+    def add_tag(self) -> None:
+        name, ok = QInputDialog.getText(self, "新增 Tag", "Tag 名称：")
+        if not ok or not name.strip():
+            return
+        color = QColorDialog.getColor(QColor("#f6c177"), self, "选择 Tag 颜色")
+        try:
+            self.tag_manager.add_tag(name, color.name() if color.isValid() else "#f6c177")
+        except ValueError as exc:
+            QMessageBox.information(self, "Koji", str(exc))
+        self.refresh()
+
+    def rename_selected(self) -> None:
+        tag_id = self.selected_tag_id()
+        tag = self.tag_manager.get(tag_id) if tag_id else None
+        if tag is None:
+            return
+        name, ok = QInputDialog.getText(self, "重命名 Tag", "Tag 名称：", text=tag.name)
+        if not ok:
+            return
+        try:
+            self.tag_manager.update_tag(tag.id, name, tag.color)
+        except ValueError as exc:
+            QMessageBox.information(self, "Koji", str(exc))
+        self.refresh()
+
+    def change_color(self) -> None:
+        tag_id = self.selected_tag_id()
+        tag = self.tag_manager.get(tag_id) if tag_id else None
+        if tag is None:
+            return
+        color = QColorDialog.getColor(QColor(tag.color), self, "选择 Tag 颜色")
+        if color.isValid():
+            self.tag_manager.update_tag(tag.id, tag.name, color.name())
+            self.refresh()
+
+    def delete_selected(self) -> None:
+        tag_id = self.selected_tag_id()
+        if not tag_id:
+            return
+        if QMessageBox.question(self, "Koji", "删除 Tag 不会删除便签，已使用便签会改为未分类。确定删除吗？") != QMessageBox.Yes:
+            return
+        self.tag_manager.delete_tag(tag_id)
+        if self.notes_manager is not None:
+            self.notes_manager.reassign_deleted_tag(tag_id)
+        self.refresh()
+
+    def restore_defaults(self) -> None:
+        if QMessageBox.question(self, "Koji", "确定恢复默认 Tag 吗？自定义 Tag 会被替换。") != QMessageBox.Yes:
+            return
+        self.tag_manager.restore_defaults()
+        self.refresh()
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, settings_manager: SettingsManager, pomodoro: PomodoroManager, tag_manager: TagManager, notes_manager: NotesManager, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.settings_manager = settings_manager
+        self.pomodoro = pomodoro
+        self.tag_manager = tag_manager
+        self.notes_manager = notes_manager
+        self.setWindowTitle("Koji 设置")
+        self.setObjectName("reportPanel")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET)
+        self.resize(460, 420)
+        self.animations = QCheckBox("开启动画")
+        self.animations.setChecked(bool(settings_manager.get("animations_enabled", True)))
+        self.chime = QCheckBox("开启整点报时")
+        self.chime.setChecked(bool(settings_manager.get("hourly_chime_enabled", True)))
+        self.quiet = QCheckBox("整点少打扰模式")
+        self.quiet.setChecked(bool(settings_manager.get("hourly_chime_quiet", False)))
+        self.start_time = QTimeEdit(QTime.fromString(str(settings_manager.get("hourly_chime_start", "09:00")), "HH:mm"))
+        self.start_time.setDisplayFormat("HH:mm")
+        self.end_time = QTimeEdit(QTime.fromString(str(settings_manager.get("hourly_chime_end", "23:00")), "HH:mm"))
+        self.end_time.setDisplayFormat("HH:mm")
+        self.focus = QSpinBox(); self.focus.setRange(1, 180); self.focus.setValue(int(settings_manager.get("pomodoro_focus_minutes", 25)))
+        self.short_break = QSpinBox(); self.short_break.setRange(1, 60); self.short_break.setValue(int(settings_manager.get("pomodoro_short_break_minutes", 5)))
+        self.long_break = QSpinBox(); self.long_break.setRange(1, 120); self.long_break.setValue(int(settings_manager.get("pomodoro_long_break_minutes", 15)))
+        tag_button = QPushButton("打开 Tag 管理")
+        tag_button.clicked.connect(self.open_tags)
+        save_button = QPushButton("保存设置")
+        save_button.clicked.connect(self.save_settings)
+        form = QFormLayout()
+        form.addRow(self.animations)
+        form.addRow(self.chime)
+        form.addRow("报时开始", self.start_time)
+        form.addRow("报时结束", self.end_time)
+        form.addRow(self.quiet)
+        form.addRow("专注分钟", self.focus)
+        form.addRow("短休息分钟", self.short_break)
+        form.addRow("长休息分钟", self.long_break)
+        form.addRow("Tag", tag_button)
+        form.addRow("本地 AI", QLabel("运行器：ai-runtime/llama-server.exe\n模型：ai-runtime/model.gguf\n所有数据仅保存在本地 data/ 目录。"))
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(save_button)
+
+    def open_tags(self) -> None:
+        dialog = TagManageDialog(self.tag_manager, self.notes_manager, self)
+        dialog.exec()
+
+    def save_settings(self) -> None:
+        self.settings_manager.set("animations_enabled", self.animations.isChecked())
+        self.settings_manager.set("hourly_chime_enabled", self.chime.isChecked())
+        self.settings_manager.set("hourly_chime_quiet", self.quiet.isChecked())
+        self.settings_manager.set("hourly_chime_start", self.start_time.time().toString("HH:mm"))
+        self.settings_manager.set("hourly_chime_end", self.end_time.time().toString("HH:mm"))
+        self.settings_manager.set("pomodoro_focus_minutes", self.focus.value())
+        self.settings_manager.set("pomodoro_short_break_minutes", self.short_break.value())
+        self.settings_manager.set("pomodoro_long_break_minutes", self.long_break.value())
+        self.pomodoro.apply_settings()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "set_animations_enabled"):
+            parent.set_animations_enabled(self.animations.isChecked())  # type: ignore[attr-defined]
+        QMessageBox.information(self, "Koji", "设置已保存。")
+
+
+class NoteCardWindow(QDialog):
+    def __init__(self, note: Note, notes_manager: NotesManager, tag_manager: TagManager, to_report_callback: Callable[[Note], None], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.note = note
+        self.notes_manager = notes_manager
+        self.tag_manager = tag_manager
+        self.to_report_callback = to_report_callback
+        self.setWindowTitle(note.title or "随手记")
+        self.setObjectName("reportPanel")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET)
+        flags = Qt.Window | Qt.Tool
+        if note.pinned:
+            flags |= Qt.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        self.resize(note.width, note.height)
+        self.move(note.x, note.y)
+        self.color_bar = QLabel()
+        self.color_bar.setFixedHeight(8)
+        self.title_edit = QLineEdit(note.title)
+        self.content_edit = QPlainTextEdit(note.content)
+        self.tag_combo = QComboBox()
+        self.refresh_tags()
+        self.pin_button = QPushButton("取消置顶" if note.pinned else "置顶")
+        self.pin_button.clicked.connect(self.toggle_pin)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.close)
+        delete_button = QPushButton("删除")
+        delete_button.clicked.connect(self.delete_note)
+        to_report_button = QPushButton("转为日报记录")
+        to_report_button.clicked.connect(self.to_report)
+        self.title_edit.textChanged.connect(self.save_from_widgets)
+        self.content_edit.textChanged.connect(self.save_from_widgets)
+        self.tag_combo.currentIndexChanged.connect(self.save_from_widgets)
+        row = QHBoxLayout()
+        for button in (self.pin_button, to_report_button, delete_button, close_button):
+            row.addWidget(button)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.color_bar)
+        layout.addWidget(self.title_edit)
+        layout.addWidget(self.tag_combo)
+        layout.addWidget(self.content_edit, 1)
+        layout.addLayout(row)
+        self.apply_color()
+
+    def refresh_tags(self) -> None:
+        self.tag_combo.blockSignals(True)
+        self.tag_combo.clear()
+        self.tag_combo.addItem("未分类", None)
+        for tag in self.tag_manager.all_tags():
+            self.tag_combo.addItem(tag.name, tag.id)
+        index = self.tag_combo.findData(self.note.tag_id)
+        self.tag_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.tag_combo.blockSignals(False)
+
+    def apply_color(self) -> None:
+        color = self.tag_manager.color_for(self.note.tag_id, self.note.color)
+        self.color_bar.setStyleSheet(f"background: {color}; border-radius: 4px;")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET + f"QDialog#reportPanel {{ background: #fff9df; border: 2px solid {color}; border-radius: 14px; }}")
+
+    def save_from_widgets(self) -> None:
+        self.note.title = self.title_edit.text().strip() or "随手记"
+        self.note.content = self.content_edit.toPlainText()
+        self.note.tag_id = self.tag_combo.currentData()
+        self.note.color = self.tag_manager.color_for(self.note.tag_id, self.note.color)
+        self.setWindowTitle(self.note.title)
+        self.apply_color()
+        self.notes_manager.touch(self.note)
+
+    def toggle_pin(self) -> None:
+        self.note.pinned = not self.note.pinned
+        self.notes_manager.touch(self.note)
+        self.pin_button.setText("取消置顶" if self.note.pinned else "置顶")
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, self.note.pinned)
+        self.show()
+
+    def to_report(self) -> None:
+        self.save_from_widgets()
+        self.to_report_callback(self.note)
+
+    def delete_note(self) -> None:
+        if QMessageBox.question(self, "Koji", "确定删除这张便签吗？") != QMessageBox.Yes:
+            return
+        self.notes_manager.delete(self.note.id)
+        self.accept()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.save_from_widgets()
+        self.note.x = self.x(); self.note.y = self.y(); self.note.width = self.width(); self.note.height = self.height(); self.note.visible = False
+        self.notes_manager.touch(self.note)
+        event.accept()
+
+    def moveEvent(self, event) -> None:  # type: ignore[override]
+        self.note.x = self.x(); self.note.y = self.y()
+        self.notes_manager.touch(self.note)
+        super().moveEvent(event)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        self.note.width = self.width(); self.note.height = self.height()
+        self.notes_manager.touch(self.note)
+        super().resizeEvent(event)
+
+
+class NotesListDialog(QDialog):
+    def __init__(self, notes_manager: NotesManager, tag_manager: TagManager, open_callback: Callable[[Note], None], delete_callback: Callable[[str], None], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.notes_manager = notes_manager
+        self.tag_manager = tag_manager
+        self.open_callback = open_callback
+        self.delete_callback = delete_callback
+        self.setWindowTitle("便签列表")
+        self.setObjectName("reportPanel")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET)
+        self.resize(520, 460)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索标题或正文……")
+        self.search.textChanged.connect(self.refresh)
+        self.tag_filter = QComboBox()
+        self.tag_filter.currentIndexChanged.connect(self.refresh)
+        self.list_widget = QListWidget()
+        self.list_widget.itemDoubleClicked.connect(lambda item: self.open_selected())
+        open_button = QPushButton("显示/打开")
+        open_button.clicked.connect(self.open_selected)
+        hide_button = QPushButton("隐藏")
+        hide_button.clicked.connect(self.hide_selected)
+        delete_button = QPushButton("删除")
+        delete_button.clicked.connect(self.delete_selected)
+        row = QHBoxLayout()
+        for button in (open_button, hide_button, delete_button):
+            row.addWidget(button)
+        top = QHBoxLayout()
+        top.addWidget(self.search, 1)
+        top.addWidget(self.tag_filter)
+        layout = QVBoxLayout(self)
+        layout.addLayout(top)
+        layout.addWidget(self.list_widget, 1)
+        layout.addLayout(row)
+        self.refresh_tags()
+        self.refresh()
+
+    def refresh_tags(self) -> None:
+        self.tag_filter.blockSignals(True)
+        self.tag_filter.clear()
+        self.tag_filter.addItem("全部 Tag", "__all__")
+        self.tag_filter.addItem("未分类", None)
+        for tag in self.tag_manager.all_tags():
+            self.tag_filter.addItem(tag.name, tag.id)
+        self.tag_filter.blockSignals(False)
+
+    def refresh(self) -> None:
+        keyword = self.search.text().strip().lower()
+        tag_id = self.tag_filter.currentData()
+        self.list_widget.clear()
+        for note in self.notes_manager.all_notes():
+            if tag_id != "__all__" and note.tag_id != tag_id:
+                continue
+            haystack = f"{note.title}\n{note.content}".lower()
+            if keyword and keyword not in haystack:
+                continue
+            tag_name = self.tag_manager.name_for(note.tag_id)
+            item = QListWidgetItem(f"{'👁' if note.visible else '—'} [{tag_name}] {note.title}\n{note.content[:60]}")
+            item.setData(Qt.UserRole, note.id)
+            self.list_widget.addItem(item)
+
+    def selected_note(self) -> Note | None:
+        item = self.list_widget.currentItem()
+        if item is None:
+            return None
+        return self.notes_manager.get(str(item.data(Qt.UserRole)))
+
+    def open_selected(self) -> None:
+        note = self.selected_note()
+        if note is not None:
+            note.visible = True
+            self.notes_manager.touch(note)
+            self.open_callback(note)
+            self.refresh()
+
+    def hide_selected(self) -> None:
+        note = self.selected_note()
+        if note is not None:
+            note.visible = False
+            self.notes_manager.touch(note)
+            self.refresh()
+
+    def delete_selected(self) -> None:
+        note = self.selected_note()
+        if note is None:
+            return
+        if QMessageBox.question(self, "Koji", "确定删除这张便签吗？") != QMessageBox.Yes:
+            return
+        self.delete_callback(note.id)
+        self.refresh()
+
 
 class KojiPet(QWidget):
     PET_SIZE = QSize(152, 152)
@@ -543,16 +957,28 @@ class KojiPet(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self.settings_manager = SettingsManager()
         self.ai_runtime = AIRuntimeManager()
         self.report_manager = ReportManager()
         self.chat_manager = ChatManager(self.ai_runtime)
+        self.tag_manager = TagManager()
+        self.notes_manager = NotesManager()
+        self.pomodoro_manager = PomodoroManager(self.settings_manager)
+        self.pomodoro_manager.phase_changed.connect(self.on_pomodoro_phase_changed)
+        self.pomodoro_manager.focus_completed.connect(self.on_pomodoro_focus_completed)
+        self.hourly_chime = HourlyChimeManager(self.settings_manager, self.report_panel_is_busy, self.pomodoro_focus_active)
+        self.hourly_chime.chime.connect(lambda message: self.bubble.show_message(message, self, 3600))
         self.report_panel: ReportPanel | None = None
         self.chat_dialog: ChatDialog | None = None
+        self.pomodoro_window: PomodoroWindow | None = None
+        self.settings_dialog: SettingsDialog | None = None
+        self.notes_list_dialog: NotesListDialog | None = None
+        self.note_windows: Dict[str, NoteCardWindow] = {}
         self.drag_position: QPoint | None = None
         self.press_position: QPoint | None = None
         self.was_dragged = False
         self.current_state = "idle"
-        self.animations_enabled = True
+        self.animations_enabled = bool(self.settings_manager.get("animations_enabled", True))
         self.is_dragging = False
         self.breath_offset = 0
         self.drag_offset = 0
@@ -602,9 +1028,11 @@ class KojiPet(QWidget):
         self.set_state("idle")
         self.start_idle_motion()
         self.schedule_random_idle_activity()
+        self.open_visible_notes()
 
     def mark_user_interaction(self) -> None:
         self.schedule_random_idle_activity()
+        self.open_visible_notes()
 
     def set_state(self, state: str, show_dialogue: bool = True) -> None:
         if state not in STATES:
@@ -709,8 +1137,16 @@ class KojiPet(QWidget):
         duration = random.randint(2_000, 4_000)
         self.temporary_state(state, duration)
 
-    def toggle_animations(self) -> None:
+
+    def set_animations_enabled(self, enabled: bool) -> None:
+        if self.animations_enabled == enabled:
+            return
+        self.toggle_animations(save=False)
+
+    def toggle_animations(self, save: bool = True) -> None:
         self.animations_enabled = not self.animations_enabled
+        if save:
+            self.settings_manager.set("animations_enabled", self.animations_enabled)
         if self.animations_enabled:
             self.sync_animation_state()
         else:
@@ -723,6 +1159,101 @@ class KojiPet(QWidget):
             self.bounce_offset = 0
             self.bounce_scale = 1.0
             self.apply_visual_transform()
+
+    def pomodoro_focus_active(self) -> bool:
+        return self.pomodoro_manager.phase == PHASE_FOCUS and self.pomodoro_manager.running
+
+    def start_pomodoro(self) -> None:
+        self.pomodoro_manager.start()
+        self.open_pomodoro_window()
+
+    def stop_pomodoro(self) -> None:
+        self.pomodoro_manager.stop()
+        self.set_state("idle")
+
+    def open_pomodoro_window(self) -> None:
+        if self.pomodoro_window is None:
+            self.pomodoro_window = PomodoroWindow(self.pomodoro_manager, self)
+        self.pomodoro_window.show()
+        self.pomodoro_window.raise_()
+        self.pomodoro_window.activateWindow()
+
+    def open_settings_dialog(self) -> None:
+        self.settings_dialog = SettingsDialog(self.settings_manager, self.pomodoro_manager, self.tag_manager, self.notes_manager, self)
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+
+    def on_pomodoro_phase_changed(self, phase: str) -> None:
+        if phase == PHASE_FOCUS:
+            self.set_state("thinking")
+        elif phase in {"short_break", "long_break"}:
+            self.set_state("sleep")
+        elif phase == "stopped":
+            self.set_state("idle")
+
+    def on_pomodoro_focus_completed(self) -> None:
+        self.set_state("happy")
+        reply = QMessageBox.question(
+            self,
+            "Koji",
+            "本轮专注完成，要不要记录一下刚才推进了什么？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self.open_report_panel()
+            if self.report_panel is not None:
+                self.report_panel.content.setFocus()
+
+    def create_note(self) -> None:
+        pos = self.frameGeometry().topRight() + QPoint(24, 0)
+        note = self.notes_manager.create_note(x=pos.x(), y=pos.y())
+        self.open_note_window(note)
+
+    def open_visible_notes(self) -> None:
+        for note in self.notes_manager.all_notes():
+            if note.visible:
+                self.open_note_window(note)
+
+    def open_note_window(self, note: Note) -> None:
+        window = self.note_windows.get(note.id)
+        if window is None:
+            window = NoteCardWindow(note, self.notes_manager, self.tag_manager, self.note_to_report, self)
+            self.note_windows[note.id] = window
+            window.finished.connect(lambda _result, note_id=note.id: self.note_windows.pop(note_id, None))
+        note.visible = True
+        self.notes_manager.touch(note)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def open_notes_list(self) -> None:
+        if self.notes_list_dialog is None:
+            self.notes_list_dialog = NotesListDialog(self.notes_manager, self.tag_manager, self.open_note_window, self.delete_note, self)
+        self.notes_list_dialog.refresh_tags()
+        self.notes_list_dialog.refresh()
+        self.notes_list_dialog.show()
+        self.notes_list_dialog.raise_()
+        self.notes_list_dialog.activateWindow()
+
+    def delete_note(self, note_id: str) -> None:
+        window = self.note_windows.pop(note_id, None)
+        if window is not None:
+            window.close()
+        self.notes_manager.delete(note_id)
+
+    def note_to_report(self, note: Note) -> None:
+        content = note.content.strip()
+        if not content:
+            QMessageBox.information(self, "Koji", "便签正文为空，先写点内容吧。")
+            return
+        category = self.tag_manager.name_for(note.tag_id, "随手记")
+        self.report_manager.add_record(category, content)
+        self.open_report_panel()
+        if self.report_panel is not None:
+            self.report_panel.refresh_records()
+        self.bubble.show_message("已把便签转成今日日报记录。", self)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton:
@@ -784,12 +1315,33 @@ class KojiPet(QWidget):
         ai_report.triggered.connect(self.ai_report_from_menu)
         animation_action = QAction("关闭动画" if self.animations_enabled else "开启动画", self)
         animation_action.triggered.connect(self.toggle_animations)
+        start_pomodoro = QAction("开始番茄钟", self)
+        start_pomodoro.triggered.connect(self.start_pomodoro)
+        pause_pomodoro = QAction("暂停/继续番茄钟", self)
+        pause_pomodoro.triggered.connect(self.pomodoro_manager.toggle_pause)
+        stop_pomodoro = QAction("停止番茄钟", self)
+        stop_pomodoro.triggered.connect(self.stop_pomodoro)
+        pomodoro_settings = QAction("番茄钟设置", self)
+        pomodoro_settings.triggered.connect(self.open_settings_dialog)
+        new_note = QAction("新建便签", self)
+        new_note.triggered.connect(self.create_note)
+        open_notes = QAction("打开便签列表", self)
+        open_notes.triggered.connect(self.open_notes_list)
+        settings_action = QAction("设置", self)
+        settings_action.triggered.connect(self.open_settings_dialog)
 
         menu.addAction(open_report)
         menu.addAction(chat)
         menu.addAction(ai_report)
         menu.addSeparator()
+        for action in (start_pomodoro, pause_pomodoro, stop_pomodoro, pomodoro_settings):
+            menu.addAction(action)
+        menu.addSeparator()
+        menu.addAction(new_note)
+        menu.addAction(open_notes)
+        menu.addSeparator()
         menu.addAction(animation_action)
+        menu.addAction(settings_action)
 
         state_menu = menu.addMenu("状态测试")
         for state in STATES:
