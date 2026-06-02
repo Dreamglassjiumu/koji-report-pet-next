@@ -31,3 +31,9 @@ data/*.tmp
 *.png
 *.gif
 *.webp
+
+data/notes.json
+data/tags.json
+data/pomodoro_stats.json
+data/settings.json
+**pycache**/
