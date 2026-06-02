@@ -1,7 +1,9 @@
 """Koji Report Pet Next desktop pet application."""
 from __future__ import annotations
 
+import math
 import os
+import random
 import sys
 from datetime import date
 from typing import Callable, Dict
@@ -9,7 +11,7 @@ from typing import Callable, Dict
 if not os.environ.get("DISPLAY") and sys.platform.startswith("linux"):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QSize, Qt, QTimer
+from PySide6.QtCore import QAbstractAnimation, QPoint, QSize, Qt, QTimer, QVariantAnimation
 from PySide6.QtGui import QAction, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -306,10 +308,14 @@ class DialogueBubble(QWidget):
     def show_message(self, message: str, anchor: QWidget, milliseconds: int = 3200) -> None:
         self.label.setText(message)
         self.adjustSize()
-        self._move_near(anchor)
+        self.follow(anchor)
         self.show()
         self.raise_()
         self.hide_timer.start(milliseconds)
+
+    def follow(self, anchor: QWidget) -> None:
+        if self.isVisible():
+            self._move_near(anchor)
 
     def _move_near(self, anchor: QWidget) -> None:
         anchor_rect = anchor.frameGeometry()
@@ -328,6 +334,13 @@ class DialogueBubble(QWidget):
 
 
 class KojiPet(QWidget):
+    PET_SIZE = QSize(152, 152)
+    VISUAL_SIZE = QSize(132, 132)
+    BREATH_AMPLITUDE = 4
+    RANDOM_IDLE_STATES = ("wave", "thinking", "happy", "sleep")
+    RANDOM_IDLE_MIN_MS = 20_000
+    RANDOM_IDLE_MAX_MS = 40_000
+
     def __init__(self) -> None:
         super().__init__()
         self.ai_runtime = AIRuntimeManager()
@@ -339,10 +352,42 @@ class KojiPet(QWidget):
         self.press_position: QPoint | None = None
         self.was_dragged = False
         self.current_state = "idle"
+        self.animations_enabled = True
+        self.is_dragging = False
+        self.breath_offset = 0
+        self.drag_offset = 0
+        self.bounce_offset = 0
+        self.bounce_scale = 1.0
+        self.base_label_pos = QPoint(
+            (self.PET_SIZE.width() - self.VISUAL_SIZE.width()) // 2,
+            (self.PET_SIZE.height() - self.VISUAL_SIZE.height()) // 2,
+        )
         self.bubble = DialogueBubble()
         self.idle_timer = QTimer(self)
         self.idle_timer.setSingleShot(True)
         self.idle_timer.timeout.connect(lambda: self.set_state("idle"))
+
+        self.breath_animation = QVariantAnimation(self)
+        self.breath_animation.setStartValue(0.0)
+        self.breath_animation.setEndValue(1.0)
+        self.breath_animation.setDuration(2400)
+        self.breath_animation.setLoopCount(-1)
+        self.breath_animation.valueChanged.connect(self.update_breath_frame)
+
+        self.bounce_animation = QVariantAnimation(self)
+        self.bounce_animation.setStartValue(0.0)
+        self.bounce_animation.setEndValue(1.0)
+        self.bounce_animation.setDuration(320)
+        self.bounce_animation.valueChanged.connect(self.update_bounce_frame)
+        self.bounce_animation.finished.connect(self.finish_bounce)
+
+        self.drag_wobble_timer = QTimer(self)
+        self.drag_wobble_timer.setInterval(120)
+        self.drag_wobble_timer.timeout.connect(self.update_drag_wobble)
+
+        self.random_idle_timer = QTimer(self)
+        self.random_idle_timer.setSingleShot(True)
+        self.random_idle_timer.timeout.connect(self.trigger_random_idle_activity)
 
         self.setWindowTitle("Koji Report Pet Next")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -351,35 +396,144 @@ class KojiPet(QWidget):
         self.customContextMenuRequested.connect(self.show_context_menu)
 
         self.label = QLabel(self)
-        self.visual = KojiVisual(self.label, QSize(132, 132))
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.label)
+        self.visual = KojiVisual(self.label, self.VISUAL_SIZE)
+        self.setFixedSize(self.PET_SIZE)
+        self.apply_visual_transform()
         self.set_state("idle")
-        self.resize(132, 132)
+        self.start_idle_motion()
+        self.schedule_random_idle_activity()
 
-    def set_state(self, state: str) -> None:
+    def mark_user_interaction(self) -> None:
+        self.schedule_random_idle_activity()
+
+    def set_state(self, state: str, show_dialogue: bool = True) -> None:
         if state not in STATES:
             state = "idle"
+        previous_state = self.current_state
         self.current_state = state
         self.visual.set_state(state)
-        dialogue = random_dialogue(state)
-        self.setToolTip(dialogue)
-        self.bubble.show_message(dialogue, self)
+        self.apply_visual_transform()
+        if show_dialogue:
+            dialogue = random_dialogue(state)
+            self.setToolTip(dialogue)
+            self.bubble.show_message(dialogue, self)
+        self.sync_animation_state()
+        if state != previous_state and state in {"collect", "success", "happy", "confused", "error", "writing"}:
+            self.play_state_bounce()
 
     def temporary_state(self, state: str, milliseconds: int = 1800) -> None:
+        self.mark_user_interaction()
         self.idle_timer.stop()
         self.set_state(state)
         if state != "idle":
             self.idle_timer.start(milliseconds)
 
+    def start_idle_motion(self) -> None:
+        if self.animations_enabled and self.current_state == "idle" and not self.is_dragging:
+            if self.breath_animation.state() != QAbstractAnimation.State.Running:
+                self.breath_animation.start()
+        else:
+            self.stop_idle_motion(reset=self.current_state != "idle" or self.is_dragging or not self.animations_enabled)
+
+    def stop_idle_motion(self, reset: bool = True) -> None:
+        if self.breath_animation.state() != QAbstractAnimation.State.Stopped:
+            self.breath_animation.stop()
+        if reset:
+            self.breath_offset = 0
+            self.apply_visual_transform()
+
+    def sync_animation_state(self) -> None:
+        self.start_idle_motion()
+        if self.animations_enabled and self.current_state == "idle" and not self.is_dragging:
+            self.schedule_random_idle_activity()
+        else:
+            self.random_idle_timer.stop()
+
+    def update_breath_frame(self, value: object) -> None:
+        if not self.animations_enabled or self.current_state != "idle" or self.is_dragging:
+            return
+        progress = float(value)
+        self.breath_offset = round(math.sin(progress * math.tau) * self.BREATH_AMPLITUDE)
+        self.apply_visual_transform()
+
+    def play_state_bounce(self) -> None:
+        if not self.animations_enabled:
+            return
+        self.bounce_animation.stop()
+        self.bounce_animation.start()
+
+    def update_bounce_frame(self, value: object) -> None:
+        progress = float(value)
+        impulse = math.sin(progress * math.pi)
+        self.bounce_scale = 1.0 + 0.06 * impulse
+        self.bounce_offset = round(-7 * impulse)
+        self.apply_visual_transform()
+
+    def finish_bounce(self) -> None:
+        self.bounce_scale = 1.0
+        self.bounce_offset = 0
+        self.apply_visual_transform()
+
+    def update_drag_wobble(self) -> None:
+        if not self.animations_enabled or not self.is_dragging:
+            self.drag_offset = 0
+        else:
+            self.drag_offset = -self.drag_offset if self.drag_offset else 3
+        self.apply_visual_transform()
+
+    def apply_visual_transform(self) -> None:
+        width = max(1, round(self.VISUAL_SIZE.width() * self.bounce_scale))
+        height = max(1, round(self.VISUAL_SIZE.height() * self.bounce_scale))
+        x = self.base_label_pos.x() + self.drag_offset - (width - self.VISUAL_SIZE.width()) // 2
+        y = self.base_label_pos.y() + self.breath_offset + self.bounce_offset - (height - self.VISUAL_SIZE.height()) // 2
+        self.label.setGeometry(x, y, width, height)
+
+    def schedule_random_idle_activity(self) -> None:
+        self.random_idle_timer.stop()
+        if not self.animations_enabled or self.current_state != "idle" or self.is_dragging:
+            return
+        self.random_idle_timer.start(random.randint(self.RANDOM_IDLE_MIN_MS, self.RANDOM_IDLE_MAX_MS))
+
+    def report_panel_is_busy(self) -> bool:
+        if self.report_panel is None or not self.report_panel.isVisible():
+            return False
+        return self.report_panel.content.hasFocus() or self.report_panel.report_text.hasFocus()
+
+    def trigger_random_idle_activity(self) -> None:
+        if not self.animations_enabled or self.current_state != "idle" or self.is_dragging or self.report_panel_is_busy():
+            self.schedule_random_idle_activity()
+            return
+        state = random.choice(self.RANDOM_IDLE_STATES)
+        duration = random.randint(2_000, 4_000)
+        self.temporary_state(state, duration)
+
+    def toggle_animations(self) -> None:
+        self.animations_enabled = not self.animations_enabled
+        if self.animations_enabled:
+            self.sync_animation_state()
+        else:
+            self.breath_animation.stop()
+            self.bounce_animation.stop()
+            self.drag_wobble_timer.stop()
+            self.random_idle_timer.stop()
+            self.breath_offset = 0
+            self.drag_offset = 0
+            self.bounce_offset = 0
+            self.bounce_scale = 1.0
+            self.apply_visual_transform()
+
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton:
+            self.mark_user_interaction()
             self.press_position = event.globalPosition().toPoint()
             self.drag_position = self.press_position - self.frameGeometry().topLeft()
             self.was_dragged = False
+            self.is_dragging = True
             self.idle_timer.stop()
+            self.stop_idle_motion()
             self.set_state("drag")
+            if self.animations_enabled:
+                self.drag_wobble_timer.start()
             event.accept()
         super().mousePressEvent(event)
 
@@ -388,21 +542,35 @@ class KojiPet(QWidget):
             if self.press_position is not None and (event.globalPosition().toPoint() - self.press_position).manhattanLength() > 8:
                 self.was_dragged = True
             self.move(event.globalPosition().toPoint() - self.drag_position)
+            self.bubble.follow(self)
             event.accept()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton:
-            should_open = not self.was_dragged
+            self.mark_user_interaction()
+            did_drag = self.was_dragged
+            should_open = not did_drag
             self.drag_position = None
             self.press_position = None
             self.was_dragged = False
-            self.set_state("idle")
+            self.is_dragging = False
+            self.drag_wobble_timer.stop()
+            self.drag_offset = 0
+            self.apply_visual_transform()
+            self.set_state("idle", show_dialogue=not did_drag)
+            if did_drag:
+                self.bubble.show_message(random_dialogue("drag"), self)
             if should_open:
                 self.open_report_panel()
         super().mouseReleaseEvent(event)
 
+    def moveEvent(self, event) -> None:  # type: ignore[override]
+        self.bubble.follow(self)
+        super().moveEvent(event)
+
     def show_context_menu(self, position: QPoint) -> None:
+        self.mark_user_interaction()
         menu = QMenu(self)
         open_report = QAction("打开日报面板", self)
         open_report.triggered.connect(self.open_report_panel)
@@ -410,10 +578,14 @@ class KojiPet(QWidget):
         chat.triggered.connect(self.open_chat_dialog)
         ai_report = QAction("AI 整理日报", self)
         ai_report.triggered.connect(self.ai_report_from_menu)
+        animation_action = QAction("关闭动画" if self.animations_enabled else "开启动画", self)
+        animation_action.triggered.connect(self.toggle_animations)
 
         menu.addAction(open_report)
         menu.addAction(chat)
         menu.addAction(ai_report)
+        menu.addSeparator()
+        menu.addAction(animation_action)
 
         state_menu = menu.addMenu("状态测试")
         for state in STATES:
@@ -453,9 +625,16 @@ class KojiPet(QWidget):
         if self.report_panel is not None:
             self.report_panel.generate_ai()
 
-    def closeEvent(self, event) -> None:  # type: ignore[override]
+    def shutdown(self) -> None:
+        for timer in (self.idle_timer, self.drag_wobble_timer, self.random_idle_timer):
+            timer.stop()
+        self.breath_animation.stop()
+        self.bounce_animation.stop()
         self.bubble.close()
         self.ai_runtime.shutdown()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.shutdown()
         super().closeEvent(event)
 
 
@@ -463,7 +642,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     pet = KojiPet()
-    app.aboutToQuit.connect(pet.ai_runtime.shutdown)
+    app.aboutToQuit.connect(pet.shutdown)
     pet.show()
     return app.exec()
 

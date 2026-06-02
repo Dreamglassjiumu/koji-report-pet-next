@@ -63,7 +63,10 @@ class KojiVisual:
         self.movie = None
         self.label.clear()
         self.label.setAlignment(Qt.AlignCenter)
-        self.label.setFixedSize(self.size)
+        self.label.setMinimumSize(1, 1)
+        self.label.setMaximumSize(16777215, 16777215)
+        self.label.resize(self.size)
+        self.label.setScaledContents(False)
 
         if asset is None:
             self._show_placeholder()
@@ -84,6 +87,7 @@ class KojiVisual:
         if pixmap.isNull():
             self._show_placeholder()
             return
+        self.label.setScaledContents(True)
         self.label.setPixmap(pixmap.scaled(self.size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def _show_placeholder(self) -> None:
