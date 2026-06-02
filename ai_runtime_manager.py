@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 
 from storage import ROOT_DIR
 
-AI_UNAVAILABLE_MESSAGE = "当前便携包未包含本地 AI 模型，可继续使用普通日报模式"
+AI_UNAVAILABLE_MESSAGE = "当前未检测到本地 AI 模型，可继续使用普通模板日报。"
 
 
 class AIRuntimeManager:
