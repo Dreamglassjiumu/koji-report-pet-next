@@ -17,10 +17,12 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -32,7 +34,7 @@ from PySide6.QtWidgets import (
 from ai_runtime_manager import AIRuntimeManager, AI_UNAVAILABLE_MESSAGE
 from chat_manager import ChatManager
 from koji_state import STATES, KojiVisual, random_dialogue
-from report_manager import CATEGORIES, ReportManager
+from report_manager import CATEGORIES, ReportManager, format_record_line
 
 
 REPORT_PANEL_STYLESHEET = """
@@ -83,24 +85,33 @@ QPushButton:pressed {
 """
 
 
+CHAT_UNAVAILABLE_REPLY = "Koji 的本地脑子还没装上，但我可以先负责可爱。等放入 model.gguf 后再来聊。"
+
+
 class ChatDialog(QDialog):
     def __init__(self, chat_manager: ChatManager, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.chat_manager = chat_manager
         self.setWindowTitle("和 Koji 聊两句")
+        self.setObjectName("reportPanel")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET)
         self.resize(480, 420)
 
         self.history_view = QPlainTextEdit()
         self.history_view.setReadOnly(True)
+        self.history_view.setPlaceholderText("这里会显示你和 Koji 的聊天记录。")
         self.input = QLineEdit()
         self.input.setPlaceholderText("和 Koji 说点什么……")
         send_button = QPushButton("发送")
         send_button.clicked.connect(self.send_message)
+        clear_button = QPushButton("清空历史")
+        clear_button.clicked.connect(self.clear_history)
         self.input.returnPressed.connect(self.send_message)
 
         bottom = QHBoxLayout()
         bottom.addWidget(self.input, 1)
         bottom.addWidget(send_button)
+        bottom.addWidget(clear_button)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.history_view, 1)
@@ -118,10 +129,18 @@ class ChatDialog(QDialog):
         self.input.clear()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            self.chat_manager.chat(text)
+            self.chat_manager.chat(text, unavailable_reply=CHAT_UNAVAILABLE_REPLY)
         finally:
             QApplication.restoreOverrideCursor()
         self.refresh()
+
+    def clear_history(self) -> None:
+        self.chat_manager.clear()
+        self.refresh()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
+        self.hide()
 
 
 class ReportPanel(QDialog):
@@ -167,8 +186,11 @@ class ReportPanel(QDialog):
 
         self.records_list = QListWidget()
         self.records_list.setObjectName("recordsList")
+        self.records_list.itemDoubleClicked.connect(self.edit_record_item)
         delete_button = QPushButton("删除记录")
         delete_button.clicked.connect(self.delete_record)
+        copy_record_button = QPushButton("复制记录")
+        copy_record_button.clicked.connect(self.copy_record)
         clear_button = QPushButton("清空今日记录")
         clear_button.clicked.connect(self.clear_today)
         template_button = QPushButton("普通模板整理日报")
@@ -177,9 +199,13 @@ class ReportPanel(QDialog):
         ai_button.clicked.connect(self.generate_ai)
         copy_button = QPushButton("复制日报")
         copy_button.clicked.connect(self.copy_report)
+        export_txt_button = QPushButton("导出 .txt")
+        export_txt_button.clicked.connect(lambda: self.export_records("txt"))
+        export_md_button = QPushButton("导出 .md")
+        export_md_button.clicked.connect(lambda: self.export_records("md"))
 
         button_row = QHBoxLayout()
-        for button in (delete_button, clear_button, template_button, ai_button, copy_button):
+        for button in (delete_button, copy_record_button, clear_button, template_button, ai_button, copy_button, export_txt_button, export_md_button):
             button_row.addWidget(button)
 
         self.report_text = QPlainTextEdit()
@@ -214,8 +240,59 @@ class ReportPanel(QDialog):
         self.records_list.clear()
         self.record_ids.clear()
         for row, record in enumerate(self.report_manager.records_for_date()):
-            self.records_list.addItem(f"[{record.category}] {record.content}")
+            item = QListWidgetItem(format_record_line(record))
+            item.setData(Qt.UserRole, record.id)
+            self.records_list.addItem(item)
             self.record_ids[row] = record.id
+
+    def current_record_id(self) -> str | None:
+        item = self.records_list.currentItem()
+        if item is not None:
+            value = item.data(Qt.UserRole)
+            return str(value) if value else None
+        return self.record_ids.get(self.records_list.currentRow())
+
+    def edit_record_item(self, item: QListWidgetItem) -> None:
+        record_id = item.data(Qt.UserRole)
+        if record_id:
+            self.edit_record(str(record_id))
+
+    def edit_record(self, record_id: str) -> None:
+        record = self.report_manager.get_record(record_id)
+        if record is None:
+            QMessageBox.information(self, "Koji", "这条记录已经不存在了。")
+            self.refresh_records()
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("编辑记录")
+        dialog.setStyleSheet(self.styleSheet())
+        category = QComboBox(dialog)
+        category.addItems(CATEGORIES)
+        category.setCurrentText(record.category)
+        content = QLineEdit(record.content, dialog)
+        content.setMinimumHeight(34)
+        save_button = QPushButton("保存修改", dialog)
+        cancel_button = QPushButton("取消", dialog)
+        save_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        buttons = QHBoxLayout()
+        buttons.addWidget(save_button)
+        buttons.addWidget(cancel_button)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"时间：{record.time or '--:--'}"))
+        layout.addWidget(category)
+        layout.addWidget(content)
+        layout.addLayout(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            self.report_manager.update_record(record_id, category.currentText(), content.text())
+        except ValueError as exc:
+            QMessageBox.information(self, "Koji", str(exc))
+            return
+        self.refresh_records()
+        self.notify_state("success")
 
     def add_record(self) -> None:
         try:
@@ -228,23 +305,45 @@ class ReportPanel(QDialog):
         self.notify_state("collect")
 
     def delete_record(self) -> None:
-        row = self.records_list.currentRow()
-        record_id = self.record_ids.get(row)
+        record_id = self.current_record_id()
         if not record_id:
             QMessageBox.information(self, "Koji", "请先选择一条记录。")
             return
         self.report_manager.delete_record(record_id)
         self.refresh_records()
 
+    def copy_record(self) -> None:
+        record_id = self.current_record_id()
+        if not record_id:
+            QMessageBox.information(self, "Koji", "请先选择一条记录。")
+            return
+        record = self.report_manager.get_record(record_id)
+        if record is None:
+            QMessageBox.information(self, "Koji", "这条记录已经不存在了。")
+            self.refresh_records()
+            return
+        QGuiApplication.clipboard().setText(format_record_line(record))
+        self.notify_state("happy")
+
     def clear_today(self) -> None:
+        if not self.report_manager.records_for_date():
+            QMessageBox.information(self, "Koji", "今天还没有记录可清空。")
+            return
+        reply = QMessageBox.question(self, "Koji", "确定要清空今日记录吗？这一步不能撤回。")
+        if reply != QMessageBox.Yes:
+            return
         self.report_manager.clear_date()
         self.refresh_records()
         self.report_text.clear()
 
     def generate_template(self) -> None:
+        if not self.report_manager.records_for_date():
+            self.report_text.setPlainText("素材不足：请先添加今日记录，Koji 再帮你整理日报。")
+            self.notify_state("confused")
+            return
         report = self.report_manager.render_template_report()
         self.report_text.setPlainText(report)
-        self.notify_state("happy" if self.report_manager.records_for_date() else "confused")
+        self.notify_state("happy")
 
     def generate_ai(self) -> None:
         material = self.report_manager.ai_material_text()
@@ -277,7 +376,36 @@ class ReportPanel(QDialog):
             QMessageBox.information(self, "Koji", "还没有可复制的日报内容。")
             return
         QGuiApplication.clipboard().setText(text)
+        self.notify_state("happy")
         QMessageBox.information(self, "Koji", "日报已复制。")
+
+    def export_records(self, extension: str) -> None:
+        records = self.report_manager.records_for_date()
+        if not records:
+            self.notify_state("confused")
+            QMessageBox.information(self, "Koji", "今天还没有记录可导出。")
+            return
+        extension = "md" if extension == "md" else "txt"
+        default_name = f"koji-records-{date.today().isoformat()}.{extension}"
+        filter_text = "Markdown 文件 (*.md)" if extension == "md" else "文本文件 (*.txt)"
+        path, _ = QFileDialog.getSaveFileName(self, "导出今日记录", default_name, filter_text)
+        if not path:
+            return
+        lines = [f"# {date.today().isoformat()} 今日记录", ""] if extension == "md" else [f"{date.today().isoformat()} 今日记录", ""]
+        lines.extend(format_record_line(record) for record in records)
+        try:
+            with open(path, "w", encoding="utf-8") as file:
+                file.write("\n".join(lines))
+        except OSError as exc:
+            self.notify_state("error")
+            QMessageBox.information(self, "Koji", f"导出失败：{exc}")
+            return
+        self.notify_state("success")
+        QMessageBox.information(self, "Koji", "今日记录已导出。")
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
+        self.hide()
 
 
 class DialogueBubble(QWidget):
@@ -308,7 +436,7 @@ class DialogueBubble(QWidget):
     def show_message(self, message: str, anchor: QWidget, milliseconds: int = 3200) -> None:
         self.label.setText(message)
         self.adjustSize()
-        self.follow(anchor)
+        self._move_near(anchor)
         self.show()
         self.raise_()
         self.hide_timer.start(milliseconds)
@@ -495,6 +623,8 @@ class KojiPet(QWidget):
         self.random_idle_timer.start(random.randint(self.RANDOM_IDLE_MIN_MS, self.RANDOM_IDLE_MAX_MS))
 
     def report_panel_is_busy(self) -> bool:
+        if self.chat_dialog is not None and self.chat_dialog.isVisible():
+            return True
         if self.report_panel is None or not self.report_panel.isVisible():
             return False
         return self.report_panel.content.hasFocus() or self.report_panel.report_text.hasFocus()
@@ -531,7 +661,7 @@ class KojiPet(QWidget):
             self.is_dragging = True
             self.idle_timer.stop()
             self.stop_idle_motion()
-            self.set_state("drag")
+            self.set_state("drag", show_dialogue=False)
             if self.animations_enabled:
                 self.drag_wobble_timer.start()
             event.accept()
@@ -543,6 +673,7 @@ class KojiPet(QWidget):
                 self.was_dragged = True
             self.move(event.globalPosition().toPoint() - self.drag_position)
             self.bubble.follow(self)
+            self.position_report_panel()
             event.accept()
         super().mouseMoveEvent(event)
 
@@ -567,6 +698,7 @@ class KojiPet(QWidget):
 
     def moveEvent(self, event) -> None:  # type: ignore[override]
         self.bubble.follow(self)
+        self.position_report_panel()
         super().moveEvent(event)
 
     def show_context_menu(self, position: QPoint) -> None:
@@ -608,6 +740,7 @@ class KojiPet(QWidget):
         self.report_panel.refresh_ai_notice()
         self.report_panel.refresh_records()
         self.report_panel.show()
+        self.position_report_panel(force=True)
         self.report_panel.raise_()
         self.report_panel.activateWindow()
 
@@ -617,8 +750,50 @@ class KojiPet(QWidget):
             self.chat_dialog = ChatDialog(self.chat_manager, self)
         self.chat_dialog.refresh()
         self.chat_dialog.show()
+        self.position_chat_dialog()
         self.chat_dialog.raise_()
         self.chat_dialog.activateWindow()
+
+
+    def position_report_panel(self, force: bool = False) -> None:
+        if self.report_panel is None or not self.report_panel.isVisible():
+            return
+        pet_rect = self.frameGeometry()
+        panel_size = self.report_panel.frameGeometry().size() if force else self.report_panel.size()
+        screen = QGuiApplication.screenAt(pet_rect.center()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        gap = 16
+        right_x = pet_rect.right() + gap
+        left_x = pet_rect.left() - panel_size.width() - gap
+        if right_x + panel_size.width() <= available.right():
+            x = right_x
+        elif left_x >= available.left():
+            x = left_x
+        else:
+            # Last-resort clamp still keeps Koji visible by preferring the less-overlapping side.
+            x = max(available.left(), min(right_x, available.right() - panel_size.width()))
+        y = pet_rect.top()
+        if y + panel_size.height() > available.bottom():
+            y = available.bottom() - panel_size.height()
+        y = max(available.top(), y)
+        self.report_panel.move(x, y)
+
+    def position_chat_dialog(self) -> None:
+        if self.chat_dialog is None or not self.chat_dialog.isVisible():
+            return
+        pet_rect = self.frameGeometry()
+        screen = QGuiApplication.screenAt(pet_rect.center()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        gap = 16
+        x = pet_rect.right() + gap
+        if x + self.chat_dialog.width() > available.right():
+            x = pet_rect.left() - self.chat_dialog.width() - gap
+        y = max(available.top(), min(pet_rect.top(), available.bottom() - self.chat_dialog.height()))
+        self.chat_dialog.move(max(available.left(), x), y)
 
     def ai_report_from_menu(self) -> None:
         self.open_report_panel()

@@ -30,7 +30,7 @@ class ChatManager:
         self.history.append({"role": role, "content": content, "time": datetime.now().isoformat(timespec="seconds")})
         self.save()
 
-    def chat(self, user_text: str) -> Tuple[bool, str]:
+    def chat(self, user_text: str, unavailable_reply: str | None = None) -> Tuple[bool, str]:
         cleaned = user_text.strip()
         if not cleaned:
             return False, "先和 Koji 说点什么吧。"
@@ -39,11 +39,15 @@ class ChatManager:
         messages.extend({"role": item.get("role", "user"), "content": item.get("content", "")} for item in self.history[-12:])
         ok, answer = self.ai_runtime.chat(messages, temperature=0.8, max_tokens=400)
         if not ok:
-            answer = AI_UNAVAILABLE_MESSAGE
+            answer = unavailable_reply or AI_UNAVAILABLE_MESSAGE
             self.add_message("assistant", answer)
             return False, answer
         self.add_message("assistant", answer)
         return True, answer
+
+    def clear(self) -> None:
+        self.history = []
+        self.save()
 
     def render_history(self) -> str:
         if not self.history:
