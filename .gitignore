@@ -1,0 +1,10 @@
+assets/koji/*.png
+assets/koji/*.webp
+assets/koji/*.gif
+ai-runtime/*.exe
+ai-runtime/*.gguf
+dist/
+build/
+__pycache__/
+data/records.json
+data/chat_history.json
