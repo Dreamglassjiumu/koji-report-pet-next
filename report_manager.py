@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Dict, List
 from uuid import uuid4
 
@@ -27,6 +27,7 @@ class ReportRecord:
     date: str
     category: str
     content: str
+    time: str
 
     @classmethod
     def from_dict(cls, data: dict) -> "ReportRecord | None":
@@ -36,12 +37,13 @@ class ReportRecord:
                 date=str(data["date"]),
                 category=str(data["category"]),
                 content=str(data["content"]),
+                time=str(data.get("time") or data.get("created_at") or ""),
             )
         except KeyError:
             return None
 
     def to_dict(self) -> dict:
-        return {"id": self.id, "date": self.date, "category": self.category, "content": self.content}
+        return {"id": self.id, "date": self.date, "category": self.category, "content": self.content, "time": self.time}
 
 
 class ReportManager:
@@ -71,6 +73,7 @@ class ReportManager:
             date=record_date or date.today().isoformat(),
             category=category if category in CATEGORIES else CATEGORIES[0],
             content=cleaned,
+            time=datetime.now().strftime("%H:%M"),
         )
         self.records.append(record)
         self.save()
@@ -79,6 +82,26 @@ class ReportManager:
     def records_for_date(self, record_date: str | None = None) -> List[ReportRecord]:
         target = record_date or date.today().isoformat()
         return [record for record in self.records if record.date == target]
+
+    def get_record(self, record_id: str) -> ReportRecord | None:
+        for record in self.records:
+            if record.id == record_id:
+                return record
+        return None
+
+    def update_record(self, record_id: str, category: str, content: str) -> ReportRecord:
+        cleaned = content.strip()
+        if not cleaned:
+            raise ValueError("事项内容不能为空")
+        record = self.get_record(record_id)
+        if record is None:
+            raise ValueError("这条记录已经不存在了。")
+        record.category = category if category in CATEGORIES else CATEGORIES[0]
+        record.content = cleaned
+        if not record.time:
+            record.time = datetime.now().strftime("%H:%M")
+        self.save()
+        return record
 
     def delete_record(self, record_id: str) -> None:
         self.records = [record for record in self.records if record.id != record_id]
@@ -112,4 +135,9 @@ class ReportManager:
 
     def ai_material_text(self, record_date: str | None = None) -> str:
         records = self.records_for_date(record_date)
-        return "\n".join(f"- {record.category}：{record.content}" for record in records)
+        return "\n".join(f"- {record.time or '--:--'} {record.category}：{record.content}" for record in records)
+
+
+def format_record_line(record: ReportRecord) -> str:
+    """Render one record for list, clipboard, and export views."""
+    return f"[{record.category}] {record.time or '--:--'}  {record.content}"
