@@ -411,6 +411,7 @@ class ReportPanel(QDialog):
 
     def generate_ai(self) -> None:
         material = self.report_manager.ai_material_text()
+        record_count = len(self.report_manager.records_for_date())
         if not material.strip():
             self.notify_state("confused")
             self.show_koji_message("还没有日报素材，先记录一点今天做了什么吧。")
@@ -423,28 +424,20 @@ class ReportPanel(QDialog):
             return
         self.notify_state("thinking")
         self.show_koji_message(STARTING_MESSAGE)
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "你是 Koji，一个文案组日报整理桌宠。你帮助游戏公司文案策划把零散记录整理成体面、真实、简洁的中文日报。"
-                    "不要编造没有提供的工作内容。不要写成客服腔，不要过度官话。默认输出结构：\n"
-                    "一、今日完成\n二、进行中\n三、明日计划\n四、风险与待确认\n"
-                    "如果素材不足，请明确提示“素材较少”，但仍基于已有素材整理一版可用日报。"
-                ),
-            },
-            {"role": "user", "content": f"今日记录素材：\n{material}"},
-        ]
+        messages = self.report_manager.build_ai_report_messages()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            ok, answer = self.ai_runtime.chat(messages, temperature=0.4, max_tokens=1000)
+            ok, answer = self.ai_runtime.chat(messages, temperature=0.45, max_tokens=2200)
         finally:
             QApplication.restoreOverrideCursor()
         self.refresh_ai_notice()
         if ok:
             self.report_text.setPlainText(answer)
             self.notify_state("happy")
-            self.show_koji_message("日报炼成完毕，去交差吧。")
+            if record_count <= 1:
+                self.show_koji_message("素材有点少，但 Koji 已经努力给你缝成体面日报了。")
+            else:
+                self.show_koji_message("日报炼成完毕，已经帮你包装得像认真推进过了。")
             return
         self.notify_state("error")
         self.show_koji_message(f"AI 整理日报失败：{answer}\n普通模板日报仍然可用，原始记录不会丢失。")
