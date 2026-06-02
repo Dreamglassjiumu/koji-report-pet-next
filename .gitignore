@@ -1,10 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build outputs
+dist/
+build/
+*.spec
+
+# Runtime-only Koji assets; repository should keep only .gitkeep or README here.
 assets/koji/*.png
 assets/koji/*.webp
 assets/koji/*.gif
+
+# Runtime-only local AI files; do not commit binaries or model weights.
 ai-runtime/*.exe
 ai-runtime/*.gguf
-dist/
-build/
-__pycache__/
+ai-runtime/*.zip
+
+# Local user data
 data/records.json
 data/chat_history.json
+data/*.tmp
