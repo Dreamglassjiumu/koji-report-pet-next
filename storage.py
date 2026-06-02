@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
-ROOT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 RECORDS_FILE = DATA_DIR / "records.json"
 CHAT_HISTORY_FILE = DATA_DIR / "chat_history.json"
