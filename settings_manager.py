@@ -15,6 +15,7 @@ DEFAULT_SETTINGS = {
     "pomodoro_focus_minutes": 25,
     "pomodoro_short_break_minutes": 5,
     "pomodoro_long_break_minutes": 15,
+    "attached_windows_follow_koji": True,
 }
 
 
