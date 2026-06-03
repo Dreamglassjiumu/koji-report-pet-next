@@ -51,7 +51,7 @@ class ChatManager:
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(self.recent_context(rounds=10))
-        ok, answer = self.ai_runtime.chat(messages, temperature=0.85, max_tokens=420)
+        ok, answer = self.ai_runtime.chat(messages, temperature=0.7, top_p=0.9, max_tokens=800)
         if not ok:
             runtime_error = answer.strip()
             if any(keyword in runtime_error for keyword in ("未检测到本地 AI 运行器", "未检测到本地 AI 模型", "本地 AI 启动失败", "启动超时", "进程已退出", "端口")):

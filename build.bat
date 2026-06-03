@@ -43,10 +43,21 @@ if exist ai-runtime\llama-server.exe (
   echo [Koji] Missing ai-runtime\llama-server.exe. Add it manually before publishing AI package.
 )
 
+if exist ai-runtime\models (
+  mkdir "%PORTABLE_DIR%\ai-runtime\models" 2>nul
+  xcopy /e /i /y ai-runtime\models "%PORTABLE_DIR%\ai-runtime\models" >nul
+) else (
+  mkdir "%PORTABLE_DIR%\ai-runtime\models" 2>nul
+)
+
+if exist ai-runtime\model_config.json (
+  copy /y ai-runtime\model_config.json "%PORTABLE_DIR%\ai-runtime\model_config.json" >nul
+)
+
 if exist ai-runtime\model.gguf (
   copy /y ai-runtime\model.gguf "%PORTABLE_DIR%\ai-runtime\model.gguf" >nul
 ) else (
-  echo [Koji] Missing ai-runtime\model.gguf. Add it manually before publishing AI package.
+  if not exist ai-runtime\models\*.gguf echo [Koji] Missing local GGUF model. Add ai-runtime\model.gguf or ai-runtime\models\*.gguf before publishing AI package.
 )
 
 if exist README_本地AI版说明.md copy /y README_本地AI版说明.md "%PORTABLE_DIR%\README_本地AI版说明.md" >nul
