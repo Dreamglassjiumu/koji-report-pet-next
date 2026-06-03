@@ -11,7 +11,7 @@ from typing import Callable, Dict
 if not os.environ.get("DISPLAY") and sys.platform.startswith("linux"):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QAbstractAnimation, QPoint, QSize, Qt, QTime, QTimer, QVariantAnimation
+from PySide6.QtCore import QAbstractAnimation, QEvent, QPoint, QSize, Qt, QTime, QTimer, QVariantAnimation
 from PySide6.QtGui import QAction, QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QSpinBox,
     QTimeEdit,
     QVBoxLayout,
@@ -96,7 +97,58 @@ QPushButton:pressed {
 """
 
 
-CHAT_UNAVAILABLE_REPLY = "Koji 的本地脑子还没装上，但我可以先负责可爱。等放入 model.gguf 后再来聊。"
+CHAT_UNAVAILABLE_REPLY = "Koji 的本地脑子还没装好，现在只能装可爱。等 model.gguf 放进去后，我再认真陪你聊。"
+
+
+class ChatInput(QPlainTextEdit):
+    """Multi-line chat input: Enter sends, Shift+Enter inserts a line break."""
+
+    def __init__(self, send_callback: Callable[[], None], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.send_callback = send_callback
+        self.setFixedHeight(72)
+        self.setPlaceholderText("和 Koji 说点什么……Enter 发送，Shift+Enter 换行")
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not event.modifiers() & Qt.ShiftModifier:
+            self.send_callback()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class ChatMessageBubble(QWidget):
+    def __init__(self, role: str, content: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        is_user = role == "user"
+        name = "你" if is_user else "Koji"
+
+        name_label = QLabel(name)
+        name_label.setStyleSheet("QLabel { color: #8a6a52; font-size: 12px; font-weight: 700; }")
+        bubble = QLabel(content)
+        bubble.setWordWrap(True)
+        bubble.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bubble.setMaximumWidth(330)
+        bubble.setStyleSheet(
+            "QLabel { color: #3e2b20; border-radius: 14px; padding: 9px 11px; "
+            + ("background: #e8f0f2; border: 1px solid #c7dadd;" if is_user else "background: #fff0cf; border: 1px solid #e9c98f;")
+            + " }"
+        )
+
+        stack = QVBoxLayout()
+        stack.setContentsMargins(0, 0, 0, 0)
+        stack.setSpacing(3)
+        stack.addWidget(name_label, 0, Qt.AlignRight if is_user else Qt.AlignLeft)
+        stack.addWidget(bubble, 0, Qt.AlignRight if is_user else Qt.AlignLeft)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(4, 4, 4, 4)
+        if is_user:
+            row.addStretch(1)
+            row.addLayout(stack)
+        else:
+            row.addLayout(stack)
+            row.addStretch(1)
 
 
 class ChatDialog(QDialog):
@@ -106,18 +158,35 @@ class ChatDialog(QDialog):
         self.setWindowTitle("和 Koji 聊两句")
         self.setObjectName("reportPanel")
         self.setStyleSheet(REPORT_PANEL_STYLESHEET)
-        self.resize(480, 420)
+        self.resize(500, 520)
 
-        self.history_view = QPlainTextEdit()
-        self.history_view.setReadOnly(True)
-        self.history_view.setPlaceholderText("这里会显示你和 Koji 的聊天记录。")
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("和 Koji 说点什么……")
+        title = QLabel("和 Koji 聊两句")
+        title.setObjectName("panelTitle")
+        hint = QLabel("Koji 可以闲聊，也可以帮你把乱七八糟的工作想法捋顺。")
+        hint.setObjectName("panelSubtitle")
+        hint.setWordWrap(True)
+
+        self.messages_widget = QWidget()
+        self.messages_layout = QVBoxLayout(self.messages_widget)
+        self.messages_layout.setContentsMargins(10, 10, 10, 10)
+        self.messages_layout.setSpacing(8)
+        self.messages_layout.addStretch(1)
+
+        self.history_view = QScrollArea()
+        self.history_view.setWidgetResizable(True)
+        self.history_view.setWidget(self.messages_widget)
+        self.history_view.setObjectName("chatScroll")
+        self.history_view.setStyleSheet(
+            "QScrollArea#chatScroll { background: rgba(255, 250, 238, 210); border: 1px solid #ead8bf; border-radius: 14px; }"
+            "QScrollArea#chatScroll QWidget { background: transparent; }"
+        )
+
+        self.input = ChatInput(self.send_message)
         send_button = QPushButton("发送")
         send_button.clicked.connect(self.send_message)
         clear_button = QPushButton("清空历史")
+        clear_button.setStyleSheet("QPushButton { color: #7a5b45; background: #fff4dc; border-color: #ead8bf; font-weight: 500; }")
         clear_button.clicked.connect(self.clear_history)
-        self.input.returnPressed.connect(self.send_message)
 
         bottom = QHBoxLayout()
         bottom.addWidget(self.input, 1)
@@ -125,16 +194,36 @@ class ChatDialog(QDialog):
         bottom.addWidget(clear_button)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+        layout.addWidget(title)
+        layout.addWidget(hint)
         layout.addWidget(self.history_view, 1)
         layout.addLayout(bottom)
         self.refresh()
 
     def refresh(self) -> None:
-        self.history_view.setPlainText(self.chat_manager.render_history())
-        self.history_view.verticalScrollBar().setValue(self.history_view.verticalScrollBar().maximum())
+        while self.messages_layout.count() > 1:
+            item = self.messages_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not self.chat_manager.history:
+            self.messages_layout.insertWidget(0, ChatMessageBubble("assistant", "可以闲聊，也可以把工作脑内垃圾倒给我。我会努力不嘲笑你，たぶん。"))
+        else:
+            for item in self.chat_manager.history[-30:]:
+                role = item.get("role", "assistant")
+                content = str(item.get("content", "")).strip()
+                if role in {"user", "assistant"} and content:
+                    self.messages_layout.insertWidget(self.messages_layout.count() - 1, ChatMessageBubble(role, content))
+        QTimer.singleShot(0, self.scroll_to_bottom)
+
+    def scroll_to_bottom(self) -> None:
+        bar = self.history_view.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     def send_message(self) -> None:
-        text = self.input.text().strip()
+        text = self.input.toPlainText().strip()
         if not text:
             return
         self.input.clear()
@@ -143,7 +232,7 @@ class ChatDialog(QDialog):
             parent.temporary_state("thinking")  # type: ignore[attr-defined]
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            ok, answer = self.chat_manager.chat(text, unavailable_reply=CHAT_UNAVAILABLE_REPLY)
+            ok, _answer = self.chat_manager.chat(text, unavailable_reply=CHAT_UNAVAILABLE_REPLY)
         finally:
             QApplication.restoreOverrideCursor()
         if parent is not None and hasattr(parent, "temporary_state"):
@@ -157,6 +246,7 @@ class ChatDialog(QDialog):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         event.ignore()
         self.hide()
+
 
 
 class ReportPanel(QDialog):
@@ -530,17 +620,29 @@ class DialogueBubble(QWidget):
 
     def _move_near(self, anchor: QWidget) -> None:
         anchor_rect = anchor.frameGeometry()
-        x = anchor_rect.right() + 10
-        y = anchor_rect.top() + 10
+        gap = 12
         screen = QGuiApplication.screenAt(anchor_rect.center()) or QGuiApplication.primaryScreen()
-        if screen is not None:
-            available = screen.availableGeometry()
-            if x + self.width() > available.right():
-                x = anchor_rect.left() - self.width() - 10
-            if y + self.height() > available.bottom():
-                y = available.bottom() - self.height() - 8
-            x = max(available.left() + 8, x)
-            y = max(available.top() + 8, y)
+        available = screen.availableGeometry() if screen is not None else None
+
+        right_top = QPoint(anchor_rect.right() + gap, anchor_rect.top() - max(0, self.height() // 3))
+        left_top = QPoint(anchor_rect.left() - self.width() - gap, anchor_rect.top() - max(0, self.height() // 3))
+        right_bottom = QPoint(anchor_rect.right() + gap, anchor_rect.bottom() - self.height())
+        candidates = (right_top, left_top, right_bottom)
+
+        x, y = right_top.x(), right_top.y()
+        if available is not None:
+            for candidate in candidates:
+                if (
+                    candidate.x() >= available.left() + 8
+                    and candidate.x() + self.width() <= available.right() - 8
+                    and candidate.y() >= available.top() + 8
+                    and candidate.y() + self.height() <= available.bottom() - 8
+                ):
+                    x, y = candidate.x(), candidate.y()
+                    break
+            else:
+                x = max(available.left() + 8, min(x, available.right() - self.width() - 8))
+                y = max(available.top() + 8, min(y, available.bottom() - self.height() - 8))
         self.move(x, y)
 
 class PomodoroWindow(QDialog):
@@ -966,6 +1068,7 @@ class KojiPet(QWidget):
         self.pomodoro_manager = PomodoroManager(self.settings_manager)
         self.pomodoro_manager.phase_changed.connect(self.on_pomodoro_phase_changed)
         self.pomodoro_manager.focus_completed.connect(self.on_pomodoro_focus_completed)
+        self.pomodoro_manager.tick.connect(self.on_pomodoro_tick)
         self.hourly_chime = HourlyChimeManager(self.settings_manager, self.report_panel_is_busy, self.pomodoro_focus_active)
         self.hourly_chime.chime.connect(lambda message: self.bubble.show_message(message, self, 3600))
         self.report_panel: ReportPanel | None = None
@@ -974,6 +1077,11 @@ class KojiPet(QWidget):
         self.settings_dialog: SettingsDialog | None = None
         self.notes_list_dialog: NotesListDialog | None = None
         self.note_windows: Dict[str, NoteCardWindow] = {}
+        self.attached_window_follow_enabled = bool(self.settings_manager.get("attached_windows_follow_koji", True))
+        self._attached_window_names: Dict[QWidget, str] = {}
+        self._detached_attached_windows: set[QWidget] = set()
+        self._positioning_attached_window = False
+        self._last_pomodoro_minute_notice: int | None = None
         self.drag_position: QPoint | None = None
         self.press_position: QPoint | None = None
         self.was_dragged = False
@@ -1163,6 +1271,15 @@ class KojiPet(QWidget):
     def pomodoro_focus_active(self) -> bool:
         return self.pomodoro_manager.phase == PHASE_FOCUS and self.pomodoro_manager.running
 
+    def on_pomodoro_tick(self) -> None:
+        if not self.pomodoro_focus_active():
+            self._last_pomodoro_minute_notice = None
+            return
+        remaining_minutes = max(1, math.ceil(self.pomodoro_manager.remaining_seconds / 60))
+        if remaining_minutes in {15, 10, 5, 1} and remaining_minutes != self._last_pomodoro_minute_notice:
+            self._last_pomodoro_minute_notice = remaining_minutes
+            self.bubble.show_message(f"专注还剩 {remaining_minutes} 分钟。稳住，别被摸鱼妖怪勾走。", self, 2600)
+
     def start_pomodoro(self) -> None:
         self.pomodoro_manager.start()
         self.open_pomodoro_window()
@@ -1174,13 +1291,17 @@ class KojiPet(QWidget):
     def open_pomodoro_window(self) -> None:
         if self.pomodoro_window is None:
             self.pomodoro_window = PomodoroWindow(self.pomodoro_manager, self)
+            self.register_attached_window(self.pomodoro_window, "pomodoro")
         self.pomodoro_window.show()
+        self.position_attached_window(self.pomodoro_window, force=True)
         self.pomodoro_window.raise_()
         self.pomodoro_window.activateWindow()
 
     def open_settings_dialog(self) -> None:
         self.settings_dialog = SettingsDialog(self.settings_manager, self.pomodoro_manager, self.tag_manager, self.notes_manager, self)
+        self.register_attached_window(self.settings_dialog, "settings")
         self.settings_dialog.show()
+        self.position_attached_window(self.settings_dialog, force=True)
         self.settings_dialog.raise_()
         self.settings_dialog.activateWindow()
 
@@ -1194,13 +1315,13 @@ class KojiPet(QWidget):
 
     def on_pomodoro_focus_completed(self) -> None:
         self.set_state("happy")
-        reply = QMessageBox.question(
-            self,
-            "Koji",
-            "本轮专注完成，要不要记录一下刚才推进了什么？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
+        prompt = QMessageBox(self)
+        prompt.setWindowTitle("Koji")
+        prompt.setText("本轮专注完成，要不要记录一下刚才推进了什么？")
+        prompt.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        prompt.setDefaultButton(QMessageBox.Yes)
+        self.position_attached_window(prompt, force=True, ignore_follow_setting=True)
+        reply = prompt.exec()
         if reply == QMessageBox.Yes:
             self.open_report_panel()
             if self.report_panel is not None:
@@ -1231,9 +1352,11 @@ class KojiPet(QWidget):
     def open_notes_list(self) -> None:
         if self.notes_list_dialog is None:
             self.notes_list_dialog = NotesListDialog(self.notes_manager, self.tag_manager, self.open_note_window, self.delete_note, self)
+            self.register_attached_window(self.notes_list_dialog, "notes")
         self.notes_list_dialog.refresh_tags()
         self.notes_list_dialog.refresh()
         self.notes_list_dialog.show()
+        self.position_attached_window(self.notes_list_dialog, force=True)
         self.notes_list_dialog.raise_()
         self.notes_list_dialog.activateWindow()
 
@@ -1276,7 +1399,7 @@ class KojiPet(QWidget):
                 self.was_dragged = True
             self.move(event.globalPosition().toPoint() - self.drag_position)
             self.bubble.follow(self)
-            self.position_report_panel()
+            self.update_attached_windows_position()
             event.accept()
         super().mouseMoveEvent(event)
 
@@ -1301,8 +1424,79 @@ class KojiPet(QWidget):
 
     def moveEvent(self, event) -> None:  # type: ignore[override]
         self.bubble.follow(self)
-        self.position_report_panel()
+        self.update_attached_windows_position()
         super().moveEvent(event)
+
+    def register_attached_window(self, window: QWidget, name: str) -> None:
+        if window not in self._attached_window_names:
+            window.installEventFilter(self)
+        self._attached_window_names[window] = name
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        if watched in self._attached_window_names and event.type() == QEvent.Move and not self._positioning_attached_window:
+            if self.attached_window_follow_enabled and watched.isVisible():
+                self._detached_attached_windows.add(watched)
+        return super().eventFilter(watched, event)
+
+    def set_attached_window_follow(self, enabled: bool) -> None:
+        self.attached_window_follow_enabled = enabled
+        self.settings_manager.set("attached_windows_follow_koji", enabled)
+        if enabled:
+            self._detached_attached_windows.clear()
+            self.update_attached_windows_position(force=True)
+            self.bubble.follow(self)
+            self.bubble.show_message("窗口跟随 Koji：开。别担心，我会把小跟班们带上。", self)
+        else:
+            self.bubble.show_message("窗口跟随 Koji：关。你摆好的窗口我不乱碰。", self)
+
+    def attached_windows(self) -> list[QWidget]:
+        windows: list[QWidget] = []
+        for window in (self.report_panel, self.chat_dialog, self.pomodoro_window, self.notes_list_dialog, self.settings_dialog):
+            if window is not None:
+                windows.append(window)
+        return windows
+
+    def position_attached_window(self, window: QWidget, preferred: str = "right", force: bool = False, ignore_follow_setting: bool = False) -> None:
+        if not window.isVisible() and not force:
+            return
+        if not self.attached_window_follow_enabled and not ignore_follow_setting:
+            return
+        if force:
+            self._detached_attached_windows.discard(window)
+        if not force and window in self._detached_attached_windows:
+            return
+
+        pet_rect = self.frameGeometry()
+        window_size = window.frameGeometry().size() if force else window.size()
+        screen = QGuiApplication.screenAt(pet_rect.center()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        gap = 16
+        right_x = pet_rect.right() + gap
+        left_x = pet_rect.left() - window_size.width() - gap
+        if preferred == "right" and right_x + window_size.width() <= available.right():
+            x = right_x
+        elif left_x >= available.left():
+            x = left_x
+        else:
+            x = max(available.left(), min(right_x, available.right() - window_size.width()))
+
+        y = pet_rect.top()
+        if y + window_size.height() > available.bottom():
+            y = available.bottom() - window_size.height()
+        if y < available.top():
+            y = available.top()
+
+        self._positioning_attached_window = True
+        try:
+            window.move(x, y)
+        finally:
+            self._positioning_attached_window = False
+
+    def update_attached_windows_position(self, force: bool = False) -> None:
+        for window in self.attached_windows():
+            self.position_attached_window(window, force=force)
 
     def show_context_menu(self, position: QPoint) -> None:
         self.mark_user_interaction()
@@ -1329,6 +1523,10 @@ class KojiPet(QWidget):
         open_notes.triggered.connect(self.open_notes_list)
         settings_action = QAction("设置", self)
         settings_action.triggered.connect(self.open_settings_dialog)
+        follow_action = QAction(f"窗口跟随 Koji：{'开' if self.attached_window_follow_enabled else '关'}", self)
+        follow_action.setCheckable(True)
+        follow_action.setChecked(self.attached_window_follow_enabled)
+        follow_action.triggered.connect(lambda checked: self.set_attached_window_follow(bool(checked)))
 
         menu.addAction(open_report)
         menu.addAction(chat)
@@ -1341,6 +1539,7 @@ class KojiPet(QWidget):
         menu.addAction(open_notes)
         menu.addSeparator()
         menu.addAction(animation_action)
+        menu.addAction(follow_action)
         menu.addAction(settings_action)
 
         state_menu = menu.addMenu("状态测试")
@@ -1361,10 +1560,11 @@ class KojiPet(QWidget):
         self.temporary_state("wave")
         if self.report_panel is None:
             self.report_panel = ReportPanel(self.report_manager, self.ai_runtime, self.temporary_state, self)
+            self.register_attached_window(self.report_panel, "report")
         self.report_panel.refresh_ai_notice()
         self.report_panel.refresh_records()
         self.report_panel.show()
-        self.position_report_panel(force=True)
+        self.position_attached_window(self.report_panel, force=True)
         self.report_panel.raise_()
         self.report_panel.activateWindow()
 
@@ -1372,52 +1572,21 @@ class KojiPet(QWidget):
         self.temporary_state("happy")
         if self.chat_dialog is None:
             self.chat_dialog = ChatDialog(self.chat_manager, self)
+            self.register_attached_window(self.chat_dialog, "chat")
         self.chat_dialog.refresh()
         self.chat_dialog.show()
-        self.position_chat_dialog()
+        self.position_attached_window(self.chat_dialog, force=True)
         self.chat_dialog.raise_()
         self.chat_dialog.activateWindow()
 
 
     def position_report_panel(self, force: bool = False) -> None:
-        if self.report_panel is None or not self.report_panel.isVisible():
-            return
-        pet_rect = self.frameGeometry()
-        panel_size = self.report_panel.frameGeometry().size() if force else self.report_panel.size()
-        screen = QGuiApplication.screenAt(pet_rect.center()) or QGuiApplication.primaryScreen()
-        if screen is None:
-            return
-        available = screen.availableGeometry()
-        gap = 16
-        right_x = pet_rect.right() + gap
-        left_x = pet_rect.left() - panel_size.width() - gap
-        if right_x + panel_size.width() <= available.right():
-            x = right_x
-        elif left_x >= available.left():
-            x = left_x
-        else:
-            # Last-resort clamp still keeps Koji visible by preferring the less-overlapping side.
-            x = max(available.left(), min(right_x, available.right() - panel_size.width()))
-        y = pet_rect.top()
-        if y + panel_size.height() > available.bottom():
-            y = available.bottom() - panel_size.height()
-        y = max(available.top(), y)
-        self.report_panel.move(x, y)
+        if self.report_panel is not None:
+            self.position_attached_window(self.report_panel, force=force)
 
     def position_chat_dialog(self) -> None:
-        if self.chat_dialog is None or not self.chat_dialog.isVisible():
-            return
-        pet_rect = self.frameGeometry()
-        screen = QGuiApplication.screenAt(pet_rect.center()) or QGuiApplication.primaryScreen()
-        if screen is None:
-            return
-        available = screen.availableGeometry()
-        gap = 16
-        x = pet_rect.right() + gap
-        if x + self.chat_dialog.width() > available.right():
-            x = pet_rect.left() - self.chat_dialog.width() - gap
-        y = max(available.top(), min(pet_rect.top(), available.bottom() - self.chat_dialog.height()))
-        self.chat_dialog.move(max(available.left(), x), y)
+        if self.chat_dialog is not None:
+            self.position_attached_window(self.chat_dialog)
 
     def ai_report_from_menu(self) -> None:
         self.open_report_panel()

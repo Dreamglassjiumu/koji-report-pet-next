@@ -4,16 +4,18 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Tuple
 
-from ai_runtime_manager import AIRuntimeManager, AI_UNAVAILABLE_MESSAGE
+from ai_runtime_manager import AIRuntimeManager
 from storage import CHAT_HISTORY_FILE, load_json, save_json
 
-SYSTEM_PROMPT = (
-    "你是 Koji，文案组桌宠。你说话有点耍宝、有点欠欠的，可以中英日混合，但要公司内部安全。"
-    "你可以吐槽日报、提醒记录、帮用户整理思路。不要输出露骨、歧视、攻击现实群体或过度冒犯内容。"
-    "遇到工作问题时优先给出实用建议。"
-    "如果用户聊到日报整理，请按文案策划工作语气提醒：普通工作日结构是“1. 今日工作内容 / 2. 明日工作内容 / 3. 近期工作内容”，"
-    "周五结构是“1. 本周工作内容 / 2. 下周一工作内容 / 3. 近期工作内容”，不要再建议使用旧版四段式标题。"
+SYSTEM_PROMPT = """你是 Koji，一个陪伴文案策划工作的桌宠。你不是严肃客服，也不是正式办公机器人。你说话有点贱贱的、轻松、吐槽感强，但要友好、可爱、不过界。你可以提醒用户记录日报、整理思路、陪用户闲聊，也可以用一点中英日混合的小梗，但不要过度。  \n当用户只是闲聊，比如问“晚上好”“你吃了吗”“累死了”，你要自然回应，不要强行扯到任务确认。  \n当用户问工作问题时，你可以给出简洁实用的建议。  \n当用户提到日报、工作记录、文案、任务、角色、剧本、pitch 时，你可以主动建议把内容记录到日报。  \n不要输出露骨、歧视、攻击现实群体或恶毒辱骂内容。  \n不要每句话都很长。聊天回复应自然、短一些，像桌宠在和用户对话。"""
+
+CHAT_UNAVAILABLE_FALLBACK = (
+    "Koji 的本地脑子还没装好，现在只能装可爱。"
+    "等 model.gguf 放进去后，我再认真陪你聊。"
 )
+CHAT_EMPTY_REPLY = "Koji 刚刚张嘴但没发出声音……本地模型返回了空内容，等我缓一秒再试。"
+CHAT_ERROR_REPLY = "Koji 的本地脑子刚刚打结了：{error}\n日报功能不受影响，可以稍后再试。"
+
 
 
 class ChatManager:
@@ -47,17 +49,20 @@ class ChatManager:
             return False, "先和 Koji 说点什么吧。"
         self.add_message("user", cleaned)
 
-        ok, file_message = self.ai_runtime.check_files()
-        if not ok:
-            answer = unavailable_reply or AI_UNAVAILABLE_MESSAGE
-            self.add_message("assistant", answer)
-            return False, answer
-
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(self.recent_context(rounds=10))
-        ok, answer = self.ai_runtime.chat(messages, temperature=0.8, max_tokens=500)
+        ok, answer = self.ai_runtime.chat(messages, temperature=0.85, max_tokens=420)
         if not ok:
-            answer = f"Koji 的本地脑子刚刚卡住了：{answer}\n日报功能不受影响，可以稍后再试。"
+            runtime_error = answer.strip()
+            if any(keyword in runtime_error for keyword in ("未检测到本地 AI 运行器", "未检测到本地 AI 模型", "本地 AI 启动失败", "启动超时", "进程已退出", "端口")):
+                answer = unavailable_reply or CHAT_UNAVAILABLE_FALLBACK
+            else:
+                answer = CHAT_ERROR_REPLY.format(error=runtime_error or "没有拿到错误信息，主打一个神秘掉线")
+            self.add_message("assistant", answer)
+            return False, answer
+        answer = answer.strip()
+        if not answer:
+            answer = CHAT_EMPTY_REPLY
             self.add_message("assistant", answer)
             return False, answer
         self.add_message("assistant", answer)
