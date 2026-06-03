@@ -1,14 +1,16 @@
-"""Local llama.cpp runtime detection, startup, shutdown, and chat calls."""
+"""Local llama.cpp runtime detection, model switching, startup, shutdown, and chat calls."""
 from __future__ import annotations
 
 import json
+import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 from enum import Enum
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, List, Tuple
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -46,34 +48,201 @@ STATUS_LABELS = {
 }
 
 
+def _model_id_from_file(filename: str) -> str:
+    stem = Path(filename).stem.lower()
+    stem = re.sub(r"[^a-z0-9]+", "-", stem).strip("-")
+    return stem or filename
+
+
+def _model_name_from_file(filename: str) -> str:
+    stem = Path(filename).stem.replace("_", " ").replace("-", " ")
+    if re.search(r"3\s*b", stem, re.IGNORECASE):
+        return f"轻量模式 {stem}".strip()
+    if re.search(r"8\s*b", stem, re.IGNORECASE):
+        return f"高质量模式 {stem}".strip()
+    return Path(filename).name
+
+
+def _model_description_from_file(filename: str) -> str:
+    if re.search(r"3\s*b", filename, re.IGNORECASE):
+        return "速度快，适合日常记录和普通日报"
+    if re.search(r"8\s*b", filename, re.IGNORECASE):
+        return "质量更高，但生成可能需要 1～3 分钟"
+    return "本地 GGUF 模型"
+
+
 class AIRuntimeManager:
     def __init__(self, runtime_dir: Path | None = None) -> None:
         self.runtime_dir = runtime_dir or ROOT_DIR / "ai-runtime"
         self.server_path = self.runtime_dir / "llama-server.exe"
-        self.model_path = self.runtime_dir / "model.gguf"
+        self.legacy_model_path = self.runtime_dir / "model.gguf"
+        self.model_path = self.legacy_model_path  # Backward-compatible public attribute used by the UI.
+        self.models_dir = self.runtime_dir / "models"
+        self.config_path = self.runtime_dir / "model_config.json"
         self.process: subprocess.Popen | None = None
         self.port: int | None = None
         self.status = AIRuntimeStatus.READY_TO_START
         self.last_error = ""
+        self._lock = threading.RLock()
+        self._generating_count = 0
+        self._cancel_generation = False
         self.refresh_status()
 
+    def _scan_model_files(self) -> list[Path]:
+        if not self.models_dir.exists():
+            return []
+        return sorted(path for path in self.models_dir.glob("*.gguf") if path.is_file())
+
+    def _default_model_entry(self, path: Path) -> dict[str, str]:
+        return {
+            "id": _model_id_from_file(path.name),
+            "name": _model_name_from_file(path.name),
+            "file": path.name,
+            "description": _model_description_from_file(path.name),
+        }
+
+    def _load_config(self) -> dict[str, Any]:
+        if not self.config_path.exists():
+            return {}
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_config(self, config: dict[str, Any]) -> None:
+        try:
+            self.runtime_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.config_path, "w", encoding="utf-8") as file:
+                json.dump(config, file, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            self.last_error = f"模型配置保存失败：{exc}"
+
+    def _models_config(self, write_default: bool = True) -> dict[str, Any]:
+        model_files = self._scan_model_files()
+        if not model_files:
+            return {"current_model": "model.gguf" if self.legacy_model_path.exists() else "", "models": []}
+
+        existing_config = self._load_config()
+        existing_models = existing_config.get("models") if isinstance(existing_config.get("models"), list) else []
+        models_by_file: dict[str, dict[str, str]] = {}
+        for item in existing_models:
+            if not isinstance(item, dict):
+                continue
+            file_name = str(item.get("file") or "")
+            if not file_name:
+                continue
+            models_by_file[file_name] = {
+                "id": str(item.get("id") or _model_id_from_file(file_name)),
+                "name": str(item.get("name") or _model_name_from_file(file_name)),
+                "file": file_name,
+                "description": str(item.get("description") or _model_description_from_file(file_name)),
+            }
+
+        models: list[dict[str, str]] = []
+        for path in model_files:
+            models.append(models_by_file.get(path.name, self._default_model_entry(path)))
+
+        available_files = {model["file"] for model in models}
+        current_model = str(existing_config.get("current_model") or "")
+        if current_model not in available_files and not any(model["id"] == current_model for model in models):
+            current_model = models[0]["file"]
+        config = {"current_model": current_model, "models": models}
+        if write_default and not self.config_path.exists():
+            self._save_config(config)
+        return config
+
+    def list_models(self) -> list[dict[str, str]]:
+        """Return available models, preferring ai-runtime/models/*.gguf and falling back to model.gguf."""
+        with self._lock:
+            config = self._models_config()
+            models = list(config.get("models") or [])
+            if models:
+                return models
+            if self.legacy_model_path.exists():
+                return [
+                    {
+                        "id": "legacy-model",
+                        "name": "旧版 model.gguf",
+                        "file": "model.gguf",
+                        "description": "兼容旧结构：ai-runtime/model.gguf",
+                    }
+                ]
+            return []
+
+    def get_current_model(self) -> dict[str, str] | None:
+        with self._lock:
+            models = self.list_models()
+            if not models:
+                return None
+            config = self._models_config(write_default=False)
+            current = str(config.get("current_model") or "")
+            for model in models:
+                if model.get("id") == current or model.get("file") == current:
+                    return model
+            return models[0]
+
+    def set_current_model(self, model_id_or_file: str) -> Tuple[bool, str]:
+        with self._lock:
+            models = self.list_models()
+            if not models:
+                self.status = AIRuntimeStatus.MISSING_MODEL
+                return False, MISSING_MODEL_MESSAGE
+            selected = next((model for model in models if model.get("id") == model_id_or_file or model.get("file") == model_id_or_file), None)
+            if selected is None:
+                return False, f"没有找到这个模型：{model_id_or_file}"
+            if selected.get("file") == "model.gguf" and not self._scan_model_files():
+                self.model_path = self.legacy_model_path
+                return True, "已选择旧版 model.gguf。"
+            config = self._models_config(write_default=False)
+            config["current_model"] = selected["file"]
+            config["models"] = [model for model in models if model.get("file") != "model.gguf"]
+            self._save_config(config)
+            self.model_path = self.models_dir / selected["file"]
+            return True, f"已选择模型：{selected.get('name') or selected.get('file')}"
+
+    def get_current_model_path(self) -> Path | None:
+        with self._lock:
+            if self._scan_model_files():
+                current = self.get_current_model()
+                if current is None:
+                    return None
+                path = self.models_dir / current["file"]
+                self.model_path = path
+                return path if path.exists() else None
+            if self.legacy_model_path.exists():
+                self.model_path = self.legacy_model_path
+                return self.legacy_model_path
+            self.model_path = self.legacy_model_path
+            return None
+
+    def is_generating(self) -> bool:
+        with self._lock:
+            return self._generating_count > 0
+
+    def cancel_generation(self) -> None:
+        with self._lock:
+            self._cancel_generation = True
+
     def refresh_status(self) -> AIRuntimeStatus:
-        if not self.server_path.exists():
-            self.status = AIRuntimeStatus.MISSING_RUNTIME
-        elif not self.model_path.exists():
-            self.status = AIRuntimeStatus.MISSING_MODEL
-        elif self.process is not None and self.process.poll() is None and self.port is not None:
-            self.status = AIRuntimeStatus.READY if self.is_ready() else AIRuntimeStatus.STARTING
-        elif self.process is not None and self.process.poll() is not None:
-            self.status = AIRuntimeStatus.ERROR
-            self.last_error = self.last_error or "本地 AI 进程已退出，请重新启动 Koji 脑子。"
-        elif self.status == AIRuntimeStatus.ERROR:
-            self.status = AIRuntimeStatus.ERROR
-        elif self.status == AIRuntimeStatus.CLOSED:
-            self.status = AIRuntimeStatus.CLOSED
-        else:
-            self.status = AIRuntimeStatus.READY_TO_START
-        return self.status
+        with self._lock:
+            if not self.server_path.exists():
+                self.status = AIRuntimeStatus.MISSING_RUNTIME
+            elif self.get_current_model_path() is None:
+                self.status = AIRuntimeStatus.MISSING_MODEL
+            elif self.process is not None and self.process.poll() is None and self.port is not None:
+                self.status = AIRuntimeStatus.READY if self.status == AIRuntimeStatus.READY else AIRuntimeStatus.STARTING
+            elif self.process is not None and self.process.poll() is not None:
+                self.status = AIRuntimeStatus.ERROR
+                self.last_error = self.last_error or "本地 AI 进程已退出，请重新启动 Koji 脑子。"
+            elif self.status == AIRuntimeStatus.ERROR:
+                self.status = AIRuntimeStatus.ERROR
+            elif self.status == AIRuntimeStatus.CLOSED:
+                self.status = AIRuntimeStatus.CLOSED
+            else:
+                self.status = AIRuntimeStatus.READY_TO_START
+            return self.status
 
     def status_message(self) -> str:
         status = self.refresh_status()
@@ -92,15 +261,16 @@ class AIRuntimeManager:
         return "本地 AI 未启动。"
 
     def check_files(self) -> Tuple[bool, str]:
-        if not self.server_path.exists():
-            self.status = AIRuntimeStatus.MISSING_RUNTIME
-            return False, MISSING_RUNTIME_MESSAGE
-        if not self.model_path.exists():
-            self.status = AIRuntimeStatus.MISSING_MODEL
-            return False, MISSING_MODEL_MESSAGE
-        if self.status in {AIRuntimeStatus.MISSING_RUNTIME, AIRuntimeStatus.MISSING_MODEL}:
-            self.status = AIRuntimeStatus.READY_TO_START
-        return True, "本地 AI 文件已就绪"
+        with self._lock:
+            if not self.server_path.exists():
+                self.status = AIRuntimeStatus.MISSING_RUNTIME
+                return False, MISSING_RUNTIME_MESSAGE
+            if self.get_current_model_path() is None:
+                self.status = AIRuntimeStatus.MISSING_MODEL
+                return False, MISSING_MODEL_MESSAGE
+            if self.status in {AIRuntimeStatus.MISSING_RUNTIME, AIRuntimeStatus.MISSING_MODEL, AIRuntimeStatus.CLOSED}:
+                self.status = AIRuntimeStatus.READY_TO_START
+            return True, "本地 AI 文件已就绪"
 
     @staticmethod
     def _port_available(port: int) -> bool:
@@ -130,6 +300,10 @@ class AIRuntimeManager:
                 self.status = AIRuntimeStatus.READY
                 return True, READY_MESSAGE
 
+        model_path = self.get_current_model_path()
+        if model_path is None:
+            self.status = AIRuntimeStatus.MISSING_MODEL
+            return False, MISSING_MODEL_MESSAGE
         port = self.choose_port()
         if port is None:
             self.status = AIRuntimeStatus.ERROR
@@ -139,7 +313,7 @@ class AIRuntimeManager:
         command = [
             str(self.server_path),
             "--model",
-            str(self.model_path),
+            str(model_path),
             "--host",
             "127.0.0.1",
             "--port",
@@ -153,21 +327,21 @@ class AIRuntimeManager:
         self.status = AIRuntimeStatus.STARTING
         self.last_error = ""
         try:
-            self.process = subprocess.Popen(command, cwd=str(ROOT_DIR), creationflags=creationflags)
+            self.process = subprocess.Popen(command, cwd=str(self.runtime_dir), creationflags=creationflags)
         except OSError as exc:
             self.status = AIRuntimeStatus.ERROR
             self.last_error = f"本地 AI 启动失败：无法运行 llama-server.exe（{exc}）。"
             return False, self.last_error
 
         self.port = port
-        for _ in range(60):
+        for _ in range(90):
             if self.is_ready():
                 self.status = AIRuntimeStatus.READY
                 self.last_error = ""
                 return True, READY_MESSAGE
             if self.process.poll() is not None:
                 self.status = AIRuntimeStatus.ERROR
-                self.last_error = "本地 AI 进程已退出，请检查 llama-server.exe 与 model.gguf 是否匹配。"
+                self.last_error = f"本地 AI 进程已退出，请检查 llama-server.exe 与 {model_path.name} 是否匹配。"
                 return False, self.last_error
             time.sleep(1)
         self.status = AIRuntimeStatus.ERROR
@@ -184,51 +358,77 @@ class AIRuntimeManager:
         except (OSError, URLError):
             return False
 
-    def chat(self, messages: List[dict], temperature: float = 0.7, max_tokens: int = 800) -> Tuple[bool, str]:
-        ok, message = self.ensure_started()
-        if not ok:
-            return False, message
-        assert self.base_url is not None
-        payload = {
-            "model": "local-model",
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
-        request = Request(
-            f"{self.base_url}/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+    def chat(self, messages: List[dict], temperature: float = 0.7, max_tokens: int = 800, top_p: float = 0.9) -> Tuple[bool, str]:
+        with self._lock:
+            self._generating_count += 1
+            self._cancel_generation = False
         try:
-            with urlopen(request, timeout=120) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except (OSError, URLError, json.JSONDecodeError) as exc:
-            self.last_error = f"本地 AI 调用失败：{exc}"
-            return False, self.last_error
+            ok, message = self.ensure_started()
+            if not ok:
+                return False, message
+            with self._lock:
+                if self._cancel_generation:
+                    return False, "生成已取消。"
+            assert self.base_url is not None
+            payload = {
+                "model": "local-model",
+                "messages": messages,
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_tokens": max_tokens,
+                "stream": False,
+            }
+            request = Request(
+                f"{self.base_url}/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urlopen(request, timeout=240) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+            except (OSError, URLError, json.JSONDecodeError) as exc:
+                self.last_error = f"本地 AI 调用失败：{exc}"
+                return False, self.last_error
+            with self._lock:
+                if self._cancel_generation:
+                    return False, "生成已取消。"
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                self.last_error = "本地 AI 返回格式异常。"
+                return False, self.last_error
+            return True, str(content).strip()
+        finally:
+            with self._lock:
+                self._generating_count = max(0, self._generating_count - 1)
+                if self._generating_count == 0:
+                    self._cancel_generation = False
 
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
-            self.last_error = "本地 AI 返回格式异常。"
-            return False, self.last_error
-        return True, str(content).strip()
-
-    def restart(self) -> Tuple[bool, str]:
-        self.shutdown(mark_closed=False)
+    def restart_with_current_model(self) -> Tuple[bool, str]:
+        self.stop_runtime(mark_closed=False)
         return self.ensure_started()
 
-    def shutdown(self, mark_closed: bool = True) -> None:
-        if self.process is not None:
-            if self.process.poll() is None:
-                self.process.terminate()
+    def restart(self) -> Tuple[bool, str]:
+        return self.restart_with_current_model()
+
+    def stop_runtime(self, mark_closed: bool = True) -> None:
+        with self._lock:
+            self._cancel_generation = True
+            process = self.process
+        if process is not None:
+            if process.poll() is None:
+                process.terminate()
                 try:
-                    self.process.wait(timeout=5)
+                    process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=5)
-            self.process = None
-        self.port = None
-        self.status = AIRuntimeStatus.CLOSED if mark_closed else AIRuntimeStatus.STOPPED
+                    process.kill()
+                    process.wait(timeout=5)
+        with self._lock:
+            if self.process is process:
+                self.process = None
+                self.port = None
+            self.status = AIRuntimeStatus.CLOSED if mark_closed else AIRuntimeStatus.STOPPED
+
+    def shutdown(self, mark_closed: bool = True) -> None:
+        self.stop_runtime(mark_closed=mark_closed)

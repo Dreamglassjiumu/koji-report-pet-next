@@ -11,8 +11,8 @@ from typing import Callable, Dict
 if not os.environ.get("DISPLAY") and sys.platform.startswith("linux"):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QAbstractAnimation, QEvent, QPoint, QSize, Qt, QTime, QTimer, QVariantAnimation
-from PySide6.QtGui import QAction, QColor, QGuiApplication
+from PySide6.QtCore import QAbstractAnimation, QEvent, QObject, QPoint, QSize, Qt, QThread, QTime, QTimer, QUrl, Signal, QVariantAnimation
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -100,6 +100,34 @@ QPushButton:pressed {
 CHAT_UNAVAILABLE_REPLY = "Koji 的本地脑子还没装好，现在只能装可爱。等 model.gguf 放进去后，我再认真陪你聊。"
 
 
+class FunctionWorker(QObject):
+    finished = Signal(object)
+
+    def __init__(self, function: Callable[[], object]) -> None:
+        super().__init__()
+        self.function = function
+
+    def run(self) -> None:
+        try:
+            self.finished.emit(self.function())
+        except Exception as exc:  # noqa: BLE001 - show friendly UI errors instead of crashing Qt.
+            self.finished.emit((False, f"Koji 执行任务时打结了：{exc}"))
+
+
+def run_in_qthread(owner: QObject, function: Callable[[], object], callback: Callable[[object], None]) -> QThread:
+    thread = QThread(owner)
+    worker = FunctionWorker(function)
+    thread.worker = worker  # type: ignore[attr-defined]
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)
+    worker.finished.connect(callback)
+    worker.finished.connect(thread.quit)
+    worker.finished.connect(worker.deleteLater)
+    thread.finished.connect(thread.deleteLater)
+    thread.start()
+    return thread
+
+
 class ChatInput(QPlainTextEdit):
     """Multi-line chat input: Enter sends, Shift+Enter inserts a line break."""
 
@@ -182,15 +210,19 @@ class ChatDialog(QDialog):
         )
 
         self.input = ChatInput(self.send_message)
-        send_button = QPushButton("发送")
-        send_button.clicked.connect(self.send_message)
+        self.send_button = QPushButton("发送")
+        self.send_button.clicked.connect(self.send_message)
+        self.cancel_button = QPushButton("取消")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_message)
         clear_button = QPushButton("清空历史")
         clear_button.setStyleSheet("QPushButton { color: #7a5b45; background: #fff4dc; border-color: #ead8bf; font-weight: 500; }")
         clear_button.clicked.connect(self.clear_history)
 
         bottom = QHBoxLayout()
         bottom.addWidget(self.input, 1)
-        bottom.addWidget(send_button)
+        bottom.addWidget(self.send_button)
+        bottom.addWidget(self.cancel_button)
         bottom.addWidget(clear_button)
 
         layout = QVBoxLayout(self)
@@ -224,20 +256,41 @@ class ChatDialog(QDialog):
 
     def send_message(self) -> None:
         text = self.input.toPlainText().strip()
-        if not text:
+        if not text or not self.send_button.isEnabled():
             return
         self.input.clear()
+        self.send_button.setEnabled(False)
+        self.send_button.setText("思考中...")
+        self.cancel_button.setEnabled(True)
         parent = self.parent()
         if parent is not None and hasattr(parent, "temporary_state"):
             parent.temporary_state("thinking")  # type: ignore[attr-defined]
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            ok, _answer = self.chat_manager.chat(text, unavailable_reply=CHAT_UNAVAILABLE_REPLY)
-        finally:
-            QApplication.restoreOverrideCursor()
+        self.chat_thread = run_in_qthread(
+            self,
+            lambda: self.chat_manager.chat(text, unavailable_reply=CHAT_UNAVAILABLE_REPLY),
+            self.finish_message,
+        )
+
+    def finish_message(self, result: object) -> None:
+        ok = False
+        if isinstance(result, tuple) and result:
+            ok = bool(result[0])
+        self.send_button.setEnabled(True)
+        self.send_button.setText("发送")
+        self.cancel_button.setEnabled(False)
+        parent = self.parent()
         if parent is not None and hasattr(parent, "temporary_state"):
             parent.temporary_state("happy" if ok else "confused")  # type: ignore[attr-defined]
         self.refresh()
+
+    def cancel_message(self) -> None:
+        self.chat_manager.ai_runtime.cancel_generation()
+        self.send_button.setEnabled(True)
+        self.send_button.setText("发送")
+        self.cancel_button.setEnabled(False)
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "temporary_state"):
+            parent.temporary_state("confused")  # type: ignore[attr-defined]
 
     def clear_history(self) -> None:
         self.chat_manager.clear()
@@ -277,6 +330,17 @@ class ReportPanel(QDialog):
 
         self.ai_status_label = QLabel("")
         self.ai_status_label.setObjectName("panelSubtitle")
+        self.model_combo = QComboBox()
+        self.model_combo.currentIndexChanged.connect(self.update_model_description)
+        self.model_description = QLabel("")
+        self.model_description.setObjectName("panelSubtitle")
+        self.model_description.setWordWrap(True)
+        self.switch_model_button = QPushButton("切换模型")
+        self.switch_model_button.clicked.connect(self.switch_model)
+        open_models_button = QPushButton("打开模型文件夹")
+        open_models_button.clicked.connect(self.open_models_folder)
+        refresh_models_button = QPushButton("刷新模型列表")
+        refresh_models_button.clicked.connect(self.refresh_model_list)
         restart_ai_button = QPushButton("重启 Koji 脑子")
         restart_ai_button.clicked.connect(self.restart_ai)
         close_ai_button = QPushButton("关闭智能模式")
@@ -288,10 +352,17 @@ class ReportPanel(QDialog):
         self.ai_detail.setVisible(False)
         detail_button = QPushButton("显示/隐藏高级信息")
         detail_button.clicked.connect(lambda: self.ai_detail.setVisible(not self.ai_detail.isVisible()))
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("当前模型："))
+        model_row.addWidget(self.model_combo, 1)
+        for button in (self.switch_model_button, open_models_button, refresh_models_button):
+            model_row.addWidget(button)
+
         ai_status_row = QHBoxLayout()
         ai_status_row.addWidget(self.ai_status_label, 1)
         for button in (restart_ai_button, close_ai_button, check_ai_button, detail_button):
             ai_status_row.addWidget(button)
+        self.refresh_model_list()
         self.refresh_ai_notice()
 
         self.date_label = QLabel(f"日期：{date.today().isoformat()}")
@@ -319,8 +390,11 @@ class ReportPanel(QDialog):
         clear_button.clicked.connect(self.clear_today)
         template_button = QPushButton("普通模板整理日报")
         template_button.clicked.connect(self.generate_template)
-        ai_button = QPushButton("AI 整理日报")
-        ai_button.clicked.connect(self.generate_ai)
+        self.ai_button = QPushButton("AI 整理日报")
+        self.ai_button.clicked.connect(self.generate_ai)
+        self.cancel_ai_button = QPushButton("取消生成")
+        self.cancel_ai_button.setEnabled(False)
+        self.cancel_ai_button.clicked.connect(self.cancel_ai_generation)
         copy_button = QPushButton("复制日报")
         copy_button.clicked.connect(self.copy_report)
         export_txt_button = QPushButton("导出 .txt")
@@ -329,7 +403,7 @@ class ReportPanel(QDialog):
         export_md_button.clicked.connect(lambda: self.export_records("md"))
 
         button_row = QHBoxLayout()
-        for button in (delete_button, copy_record_button, clear_button, template_button, ai_button, copy_button, export_txt_button, export_md_button):
+        for button in (delete_button, copy_record_button, clear_button, template_button, self.ai_button, self.cancel_ai_button, copy_button, export_txt_button, export_md_button):
             button_row.addWidget(button)
 
         self.report_text = QPlainTextEdit()
@@ -342,6 +416,8 @@ class ReportPanel(QDialog):
         layout.addWidget(self.title_label)
         layout.addWidget(self.subtitle_label)
         layout.addWidget(self.ai_notice)
+        layout.addLayout(model_row)
+        layout.addWidget(self.model_description)
         layout.addLayout(ai_status_row)
         layout.addWidget(self.ai_detail)
         layout.addWidget(self.date_label)
@@ -352,6 +428,79 @@ class ReportPanel(QDialog):
         layout.addWidget(QLabel("日报草稿："))
         layout.addWidget(self.report_text, 2)
         self.refresh_records()
+
+    def refresh_model_list(self) -> None:
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        current = self.ai_runtime.get_current_model()
+        current_key = (current or {}).get("file") or (current or {}).get("id")
+        for model in self.ai_runtime.list_models():
+            self.model_combo.addItem(model.get("name") or model.get("file") or "未命名模型", model)
+            if model.get("file") == current_key or model.get("id") == current_key:
+                self.model_combo.setCurrentIndex(self.model_combo.count() - 1)
+        self.model_combo.blockSignals(False)
+        self.update_model_description()
+        self.refresh_ai_notice()
+
+    def selected_model(self) -> dict | None:
+        data = self.model_combo.currentData()
+        return data if isinstance(data, dict) else None
+
+    def update_model_description(self) -> None:
+        model = self.selected_model() or self.ai_runtime.get_current_model()
+        if not model:
+            self.model_description.setText("未检测到可用 GGUF 模型。旧结构可继续使用 ai-runtime/model.gguf；多模型请放入 ai-runtime/models/。")
+            return
+        description = model.get("description") or "本地 GGUF 模型"
+        name_and_file = f"{description}\n文件：{model.get('file', '未知')}"
+        is_quality = any(keyword in (model.get("name", "") + model.get("file", "") + description).lower() for keyword in ("高质量", "8b"))
+        if is_quality:
+            name_and_file += "\n高质量模型生成较慢，可能需要 1～3 分钟，Koji 不是死了，是在憋大的。"
+        self.model_description.setText(name_and_file)
+
+    def open_models_folder(self) -> None:
+        self.ai_runtime.models_dir.mkdir(parents=True, exist_ok=True)
+        if self.ai_runtime.legacy_model_path.exists() and not self.ai_runtime._scan_model_files():
+            self.show_koji_message("你也可以把多个模型放入 ai-runtime/models/，然后在 Koji 里切换。")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.ai_runtime.models_dir)))
+
+    def switch_model(self) -> None:
+        model = self.selected_model()
+        if not model:
+            self.show_koji_message("还没有可切换的模型，请先把 GGUF 放进 ai-runtime/models/。")
+            return
+        if self.ai_runtime.is_generating():
+            reply = QMessageBox.question(
+                self,
+                "Koji",
+                "Koji 正在生成内容，切换模型需要先停止当前任务。",
+                QMessageBox.Cancel | QMessageBox.Yes,
+                QMessageBox.Cancel,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            self.cancel_ai_generation(show_message=False)
+            self.ai_runtime.cancel_generation()
+        self.notify_state("thinking")
+        self.show_koji_message("Koji 正在换脑子……")
+        selected = model.get("id") or model.get("file") or ""
+
+        def task() -> tuple[bool, str]:
+            ok, message = self.ai_runtime.set_current_model(selected)
+            if not ok:
+                return ok, message
+            if self.ai_runtime.process is not None and self.ai_runtime.process.poll() is None:
+                return self.ai_runtime.restart_with_current_model()
+            return True, "模型切好了，Koji 换了个脑子。"
+
+        self.switch_thread = run_in_qthread(self, task, self.finish_switch_model)
+
+    def finish_switch_model(self, result: object) -> None:
+        ok, message = result if isinstance(result, tuple) and len(result) >= 2 else (False, "模型切换失败。")
+        self.refresh_model_list()
+        self.refresh_ai_notice()
+        self.notify_state("success" if ok else "error")
+        self.show_koji_message("模型切好了，Koji 换了个脑子。" if ok else f"切换模型失败：{message}")
 
     def notify_state(self, state: str) -> None:
         if self.state_callback is not None:
@@ -375,7 +524,7 @@ class ReportPanel(QDialog):
             "高级信息：\n"
             f"当前端口：{port_text}\n"
             f"runtime 路径：{self.ai_runtime.server_path}\n"
-            f"model 路径：{self.ai_runtime.model_path}\n"
+            f"model 路径：{self.ai_runtime.get_current_model_path() or self.ai_runtime.model_path}\n"
             f"最近错误：{self.ai_runtime.last_error or '无'}"
         )
 
@@ -386,16 +535,16 @@ class ReportPanel(QDialog):
     def restart_ai(self) -> None:
         self.notify_state("thinking")
         self.show_koji_message(STARTING_MESSAGE)
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            ok, message = self.ai_runtime.restart()
-        finally:
-            QApplication.restoreOverrideCursor()
+        self.restart_thread = run_in_qthread(self, self.ai_runtime.restart_with_current_model, self.finish_restart_ai)
+
+    def finish_restart_ai(self, result: object) -> None:
+        ok, message = result if isinstance(result, tuple) and len(result) >= 2 else (False, "Koji 脑子重启失败。")
         self.refresh_ai_notice()
         self.notify_state("success" if ok else "error")
-        self.show_koji_message(message)
+        self.show_koji_message(str(message))
 
     def close_ai(self) -> None:
+        self.cancel_ai_generation(show_message=False)
         self.ai_runtime.shutdown()
         self.notify_state("sleep")
         self.refresh_ai_notice()
@@ -511,8 +660,10 @@ class ReportPanel(QDialog):
         self.notify_state("happy")
 
     def generate_ai(self) -> None:
+        if not self.ai_button.isEnabled():
+            return
         material = self.report_manager.ai_material_text()
-        record_count = len(self.report_manager.records_for_date())
+        self.ai_record_count = len(self.report_manager.records_for_date())
         if not material.strip():
             self.notify_state("confused")
             self.show_koji_message("还没有日报素材，先记录一点今天做了什么吧。")
@@ -523,22 +674,53 @@ class ReportPanel(QDialog):
             self.notify_state("confused")
             self.show_koji_message(check_message)
             return
+        self.ai_generation_cancelled = False
+        self.ai_button.setText("生成中...")
+        self.ai_button.setEnabled(False)
+        self.cancel_ai_button.setEnabled(True)
         self.notify_state("thinking")
-        self.show_koji_message(STARTING_MESSAGE)
+        self.show_koji_message("Koji 正在认真憋日报，高质量模型可能需要 1～3 分钟。")
+        self.ai_wait_60_timer = QTimer.singleShot(60000, self.show_ai_wait_60_message)
+        self.ai_wait_180_timer = QTimer.singleShot(180000, self.show_ai_wait_180_message)
         messages = self.report_manager.build_ai_report_messages()
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            ok, answer = self.ai_runtime.chat(messages, temperature=0.45, max_tokens=2200)
-        finally:
-            QApplication.restoreOverrideCursor()
+        self.ai_report_thread = run_in_qthread(
+            self,
+            lambda: self.ai_runtime.chat(messages, temperature=0.45, top_p=0.9, max_tokens=2600),
+            self.finish_ai_generation,
+        )
+
+    def show_ai_wait_60_message(self) -> None:
+        if not self.ai_button.isEnabled():
+            self.show_koji_message("模型比较大，Koji 还在写，别急。")
+
+    def show_ai_wait_180_message(self) -> None:
+        if not self.ai_button.isEnabled():
+            self.show_koji_message("这颗脑子有点沉，建议稍后再试或切换轻量模型。")
+
+    def cancel_ai_generation(self, show_message: bool = True) -> None:
+        if self.ai_button.isEnabled() and not self.ai_runtime.is_generating():
+            return
+        self.ai_generation_cancelled = True
+        self.ai_runtime.cancel_generation()
+        self.ai_button.setText("AI 整理日报")
+        self.ai_button.setEnabled(True)
+        self.cancel_ai_button.setEnabled(False)
+        if show_message:
+            self.notify_state("confused")
+            self.show_koji_message("这次先不憋了，素材还在。")
+
+    def finish_ai_generation(self, result: object) -> None:
+        if getattr(self, "ai_generation_cancelled", False):
+            return
+        self.ai_button.setText("AI 整理日报")
+        self.ai_button.setEnabled(True)
+        self.cancel_ai_button.setEnabled(False)
         self.refresh_ai_notice()
+        ok, answer = result if isinstance(result, tuple) and len(result) >= 2 else (False, "本地 AI 返回了未知结果。")
         if ok:
-            self.report_text.setPlainText(clean_ai_report_text(answer))
+            self.report_text.setPlainText(clean_ai_report_text(str(answer)))
             self.notify_state("happy")
-            if record_count <= 1:
-                self.show_koji_message("素材有点少，但 Koji 已经努力给你缝成体面日报了。")
-            else:
-                self.show_koji_message("日报炼成完毕，已经帮你包装得像认真推进过了。")
+            self.show_koji_message("日报炼成完毕，去交差吧。")
             return
         self.notify_state("error")
         self.show_koji_message(f"AI 整理日报失败：{answer}\n普通模板日报仍然可用，原始记录不会丢失。")

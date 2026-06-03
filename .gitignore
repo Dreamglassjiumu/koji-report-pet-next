@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
 .venv/
 venv/
@@ -18,11 +19,20 @@ assets/koji/*.gif
 ai-runtime/*.exe
 ai-runtime/*.gguf
 ai-runtime/*.zip
+ai-runtime/models/*.gguf
+ai-runtime/models/**/*.gguf
+ai-runtime/model_config.json
 
 # Local user data
 data/records.json
 data/chat_history.json
+data/notes.json
+data/tags.json
+data/pomodoro_stats.json
+data/settings.json
 data/*.tmp
+
+# Binary release/runtime files
 *.7z
 *.rar
 *.exe
@@ -31,9 +41,3 @@ data/*.tmp
 *.png
 *.gif
 *.webp
-
-data/notes.json
-data/tags.json
-data/pomodoro_stats.json
-data/settings.json
-**pycache**/
