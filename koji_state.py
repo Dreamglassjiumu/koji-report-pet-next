@@ -1,4 +1,4 @@
-"""Koji state and asset loading utilities."""
+"""Companion state and character-aware asset loading utilities."""
 from __future__ import annotations
 
 import random
@@ -9,27 +9,20 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QMovie, QPixmap
 from PySide6.QtWidgets import QLabel
 
-from storage import DIALOGUES_FILE, ROOT_DIR, load_json
+from character_manager import CharacterPackage, COMPANION_STATES
+from storage import DIALOGUES_FILE, load_json
 
-STATES: List[str] = [
-    "idle",
-    "wave",
-    "record_ready",
-    "collect",
-    "success",
-    "thinking",
-    "writing",
-    "happy",
-    "confused",
-    "angry",
-    "sleep",
-    "drag",
-    "error",
-]
-
-ASSET_DIR = ROOT_DIR / "assets" / "koji"
-ASSET_EXTENSIONS = ("png", "webp", "gif")
-PLACEHOLDER = "🐱\nKoji"
+STATES: List[str] = list(COMPANION_STATES)
+STATE_ALIASES = {
+    "wave": "idle",
+    "record_ready": "idle",
+    "collect": "thinking",
+    "writing": "typing",
+    "happy": "success",
+    "confused": "error",
+    "angry": "error",
+    "drag": "idle",
+}
 PLACEHOLDER_STYLESHEET = (
     "QLabel { color: #6b4b35; font-size: 28px; font-weight: 700; "
     "background: rgba(255, 246, 225, 190); border: 2px solid rgba(107,75,53,90); "
@@ -37,29 +30,47 @@ PLACEHOLDER_STYLESHEET = (
 )
 
 
-def find_state_asset(state: str) -> Path | None:
-    """Return the best matching image for a state, with idle fallback."""
-    candidates = [state]
-    if state != "idle":
-        candidates.append("idle")
-    for candidate in candidates:
-        for extension in ASSET_EXTENSIONS:
-            path = ASSET_DIR / f"{candidate}.{extension}"
-            if path.exists():
-                return path
-    return None
+def normalize_state(state: str) -> str:
+    normalized = STATE_ALIASES.get(state, state)
+    return normalized if normalized in STATES else "idle"
 
 
 class KojiVisual:
-    """Small wrapper that swaps image/gif assets or text placeholder on a label."""
+    """Swaps character images/gifs by companion state with safe fallback."""
 
-    def __init__(self, label: QLabel, size: QSize) -> None:
+    def __init__(self, label: QLabel, size: QSize, character: CharacterPackage | None = None) -> None:
         self.label = label
         self.size = size
+        self.character = character
+        self.current_state = "idle"
         self.movie: QMovie | None = None
 
+    def set_character(self, character: CharacterPackage | None) -> None:
+        self.character = character
+        self.set_state(self.current_state)
+
     def set_state(self, state: str) -> None:
-        asset = find_state_asset(state)
+        self.current_state = normalize_state(state)
+        asset = self._asset_for_state(self.current_state)
+        self._show_asset(asset)
+
+    def show_random_idle_variant(self) -> bool:
+        if self.character is None:
+            return False
+        variants = self.character.idle_variants()
+        if not variants:
+            self.set_state("idle")
+            return False
+        self.current_state = "idle"
+        self._show_asset(random.choice(variants))
+        return True
+
+    def _asset_for_state(self, state: str) -> Path | None:
+        if self.character is None:
+            return None
+        return self.character.state_asset(state)
+
+    def _show_asset(self, asset: Path | None) -> None:
         self.movie = None
         self.label.clear()
         self.label.setAlignment(Qt.AlignCenter)
@@ -91,7 +102,8 @@ class KojiVisual:
         self.label.setPixmap(pixmap.scaled(self.size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def _show_placeholder(self) -> None:
-        self.label.setText(PLACEHOLDER)
+        name = self.character.name if self.character is not None else "Koji"
+        self.label.setText(f"🐱\n{name}")
         self.label.setStyleSheet(PLACEHOLDER_STYLESHEET)
 
 
@@ -108,5 +120,6 @@ def load_dialogues() -> Dict[str, List[str]]:
 
 def random_dialogue(state: str, fallback: str = "Koji 在这里陪你整理今天。") -> str:
     dialogues = load_dialogues()
-    options = dialogues.get(state) or dialogues.get("idle") or [fallback]
+    normalized_state = normalize_state(state)
+    options = dialogues.get(normalized_state) or dialogues.get(state) or dialogues.get("idle") or [fallback]
     return random.choice(options)

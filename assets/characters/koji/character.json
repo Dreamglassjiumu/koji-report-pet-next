@@ -1,0 +1,13 @@
+{
+  "id": "koji",
+  "name": "Koji",
+  "version": "1.0",
+  "states": {
+    "idle": "idle.png",
+    "thinking": "thinking.png",
+    "typing": "typing.png",
+    "success": "success.png",
+    "error": "error.png",
+    "sleep": "sleep.png"
+  }
+}
