@@ -156,12 +156,69 @@ QToolButton#accordionHeader:hover {
     background: #ffe6b8;
 }
 QPushButton#toolbarButton {
-    padding: 8px 12px;
+    padding: 8px 14px;
+    min-width: 72px;
+}
+QFrame#buttonGroup {
+    background: rgba(255, 244, 220, 150);
+    border: 1px solid #ead8bf;
+    border-radius: 14px;
+}
+QLabel#groupLabel {
+    color: #8a6a52;
+    font-size: 12px;
+    font-weight: 800;
+}
+QLabel#stateBadge {
+    color: #7a4b16;
+    background: #fff0c2;
+    border: 1px solid #edcc87;
+    border-radius: 12px;
+    padding: 6px 10px;
+    font-size: 13px;
+    font-weight: 800;
+}
+QScrollArea#functionCenter {
+    background: transparent;
+}
+QScrollArea#functionCenter QScrollBar:vertical {
+    background: rgba(246, 231, 209, 120);
+    width: 10px;
+    margin: 4px 0 4px 0;
+    border-radius: 5px;
+}
+QScrollArea#functionCenter QScrollBar::handle:vertical {
+    background: #e4c79f;
+    border-radius: 5px;
+    min-height: 28px;
+}
+QScrollArea#functionCenter QScrollBar::handle:vertical:hover {
+    background: #d9b678;
+}
+QScrollArea#functionCenter QScrollBar::add-line:vertical,
+QScrollArea#functionCenter QScrollBar::sub-line:vertical {
+    height: 0;
+}
+QScrollArea#functionCenter QScrollBar::add-page:vertical,
+QScrollArea#functionCenter QScrollBar::sub-page:vertical {
+    background: transparent;
 }
 """
 
 
 CHAT_UNAVAILABLE_REPLY = "Koji 的本地脑子还没装好，现在只能装可爱。等 model.gguf 放进去后，我再认真陪你聊。"
+STATE_DISPLAY_LABELS = {
+    "idle": "待机中",
+    "thinking": "思考中",
+    "typing": "写作中",
+    "success": "完成",
+    "error": "出错",
+    "sleep": "休眠",
+}
+
+
+def state_display_label(state: str) -> str:
+    return STATE_DISPLAY_LABELS.get(normalize_state(state), "待机中")
 
 
 class FunctionWorker(QObject):
@@ -486,7 +543,7 @@ class CollapsibleSection(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(9)
         layout.addWidget(self.toggle_button)
         layout.addWidget(self.content)
         self.set_expanded(expanded)
@@ -516,6 +573,9 @@ class CharacterCard(QFrame):
         self.level_label = QLabel("Lv1 陌生")
         self.level_label.setStyleSheet("QLabel { color: #5c3b25; font-size: 18px; font-weight: 900; }")
         self.level_label.setAlignment(Qt.AlignCenter)
+        self.state_label = QLabel(f"当前状态：{state_display_label('idle')}")
+        self.state_label.setObjectName("stateBadge")
+        self.state_label.setAlignment(Qt.AlignCenter)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.exp_label = QLabel("0 / 50")
@@ -535,13 +595,18 @@ class CharacterCard(QFrame):
         layout.addWidget(self.avatar, 0, Qt.AlignHCenter)
         layout.addWidget(self.name_label)
         layout.addWidget(self.level_label)
+        layout.addWidget(self.state_label)
         layout.addWidget(self.progress)
         layout.addWidget(self.exp_label)
         layout.addWidget(self.collection_label)
         layout.addWidget(self.tip_label)
         layout.addStretch(1)
 
-    def refresh(self, character) -> None:
+    def set_status(self, state: str) -> None:
+        self.state_label.setText(f"当前状态：{state_display_label(state)}")
+
+    def refresh(self, character, state: str = "idle") -> None:
+        self.set_status(state)
         character_id = getattr(character, "id", "koji")
         character_name = getattr(character, "name", "Koji")
         self.name_label.setText(character_name)
@@ -748,12 +813,16 @@ class ReportPanel(QDialog):
         export_md_button = QPushButton("导出 MD")
         export_md_button.clicked.connect(lambda: self.export_records("md"))
 
-        button_row = QHBoxLayout()
-        button_row.setSpacing(8)
-        for button in (self.ai_button, template_button, copy_button, export_txt_button, export_md_button, copy_record_button, delete_button, clear_button, self.cancel_ai_button):
+        for button in (self.ai_button, template_button, self.cancel_ai_button, copy_record_button, delete_button, clear_button, copy_button, export_txt_button, export_md_button):
             button.setObjectName("toolbarButton")
-            button_row.addWidget(button)
-        button_row.addStretch(1)
+        export_txt_button.setMinimumWidth(92)
+        export_md_button.setMinimumWidth(92)
+
+        button_groups = QVBoxLayout()
+        button_groups.setSpacing(8)
+        button_groups.addWidget(self.create_toolbar_group("整理", [self.ai_button, template_button, self.cancel_ai_button]))
+        button_groups.addWidget(self.create_toolbar_group("记录", [copy_record_button, delete_button, clear_button]))
+        button_groups.addWidget(self.create_toolbar_group("导出", [copy_button, export_txt_button, export_md_button]))
 
         self.report_text = QPlainTextEdit()
         self.report_text.setObjectName("reportText")
@@ -768,7 +837,7 @@ class ReportPanel(QDialog):
         workspace.addLayout(input_row)
         workspace.addWidget(QLabel("今日记录："))
         workspace.addWidget(self.records_list, 3)
-        workspace.addLayout(button_row)
+        workspace.addLayout(button_groups)
         workspace.addWidget(QLabel("日报草稿："))
         workspace.addWidget(self.report_text, 4)
 
@@ -780,8 +849,8 @@ class ReportPanel(QDialog):
 
         function_scroll_body = QWidget()
         function_layout = QVBoxLayout(function_scroll_body)
-        function_layout.setContentsMargins(0, 0, 0, 0)
-        function_layout.setSpacing(10)
+        function_layout.setContentsMargins(4, 2, 8, 4)
+        function_layout.setSpacing(12)
         function_layout.addWidget(CollapsibleSection("收藏柜", self.collection_widget, True))
         function_layout.addWidget(CollapsibleSection("Tag 管理", tag_panel, False))
         function_layout.addWidget(CollapsibleSection("分类管理", category_panel, False))
@@ -793,9 +862,9 @@ class ReportPanel(QDialog):
         function_scroll.setWidgetResizable(True)
         function_scroll.setWidget(function_scroll_body)
         function_scroll.setFrameShape(QFrame.NoFrame)
-        function_scroll.setMinimumWidth(260)
-        function_scroll.setMaximumWidth(320)
-        function_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        function_scroll.setObjectName("functionCenter")
+        function_scroll.setMinimumWidth(270)
+        function_scroll.setMaximumWidth(330)
 
         header = QHBoxLayout()
         header.addWidget(self.title_label)
@@ -836,11 +905,34 @@ class ReportPanel(QDialog):
         character = self.current_character()
         return getattr(character, "name", "Koji") or "Koji"
 
+    def current_pet_state(self) -> str:
+        parent = self.parent_pet()
+        return getattr(parent, "current_state", "idle")
+
     def refresh_character_card(self) -> None:
         self.subtitle_label.setText(f"当前角色：{self.current_character_name()} · 日期：{date.today().isoformat()}")
-        self.character_card.refresh(self.current_character())
+        self.character_card.refresh(self.current_character(), self.current_pet_state())
         if hasattr(self, "collection_widget"):
             self.collection_widget.refresh()
+
+    def refresh_state_badge(self, state: str) -> None:
+        self.character_card.set_status(state)
+
+    def create_toolbar_group(self, title: str, buttons: list[QPushButton]) -> QFrame:
+        group = QFrame()
+        group.setObjectName("buttonGroup")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(6)
+        label = QLabel(f"{title}组")
+        label.setObjectName("groupLabel")
+        layout.addWidget(label)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        for button in buttons:
+            row.addWidget(button)
+        layout.addLayout(row)
+        return group
 
     def create_button_panel(self, hint: str, buttons: list[tuple[str, Callable[[], None]]]) -> QFrame:
         panel = QFrame()
@@ -2080,6 +2172,8 @@ class KojiPet(QWidget):
             self.setToolTip(dialogue)
             self.bubble.show_message(dialogue, self)
         self.sync_animation_state()
+        if self.report_panel is not None:
+            self.report_panel.refresh_state_badge(state)
         if state != previous_state and state in {"thinking", "typing", "success", "error"}:
             self.play_state_bounce()
 
