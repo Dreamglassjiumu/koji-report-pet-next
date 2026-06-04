@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QInputDialog,
@@ -49,6 +50,7 @@ from character_manager import CharacterManager
 from chat_manager import ChatManager
 from koji_state import STATES, KojiVisual, normalize_state, random_dialogue
 from report_manager import ReportManager, clean_ai_report_text, format_record_line
+from reward_manager import LevelReward, RewardManager
 from relationship_manager import (
     EXP_CHARACTER_IMPORT,
     EXP_CHAT_SUCCESS,
@@ -209,11 +211,19 @@ QScrollArea#functionCenter QScrollBar::sub-page:vertical {
 CHAT_UNAVAILABLE_REPLY = "Koji 的本地脑子还没装好，现在只能装可爱。等 model.gguf 放进去后，我再认真陪你聊。"
 STATE_DISPLAY_LABELS = {
     "idle": "待机中",
+    "drag": "被拽走中",
     "thinking": "思考中",
     "typing": "写作中",
-    "success": "完成",
-    "error": "出错",
-    "sleep": "休眠",
+    "writing": "写作中",
+    "success": "完成啦",
+    "error": "脑子打滑",
+    "sleep": "休息中",
+    "happy": "开心",
+    "confused": "困惑中",
+    "angry": "生气中",
+    "collect": "收藏中",
+    "record_ready": "记录就绪",
+    "wave": "打招呼",
 }
 
 
@@ -704,6 +714,209 @@ class CollectionCabinetWidget(QFrame):
         self.description_label.setText(collectible.description)
 
 
+class RewardPreviewDialog(QDialog):
+    """Large preview for one unlocked memory reward."""
+
+    def __init__(self, reward: LevelReward, record: dict | None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(reward.title)
+        self.setObjectName("reportPanel")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET)
+        self.resize(720, 640)
+        image_label = QLabel()
+        image_label.setAlignment(Qt.AlignCenter)
+        image_label.setMinimumHeight(360)
+        self._set_reward_pixmap(image_label, reward.image_path, QSize(660, 380))
+        title = QLabel(f"{reward.title} · Lv{reward.level}")
+        title.setObjectName("panelTitle")
+        subtitle = QLabel(reward.subtitle)
+        subtitle.setObjectName("panelSubtitle")
+        subtitle.setWordWrap(True)
+        unlocked_at = (record or {}).get("unlocked_at", "未知时间")
+        meta = QLabel(f"解锁时间：{unlocked_at}")
+        meta.setObjectName("miniMeta")
+        description = QLabel(reward.description)
+        description.setObjectName("panelSubtitle")
+        description.setWordWrap(True)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 22, 22, 22)
+        layout.setSpacing(12)
+        layout.addWidget(image_label)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(meta)
+        layout.addWidget(description)
+        layout.addWidget(close_button, 0, Qt.AlignRight)
+
+    def _set_reward_pixmap(self, label: QLabel, image_path, size: QSize) -> None:
+        if image_path is None:
+            label.setText("奖励图片暂未放入本地资源。")
+            label.setStyleSheet("QLabel { color: #8a6a52; background: #fff0cf; border: 1px dashed #d9b678; border-radius: 18px; padding: 24px; }")
+            return
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            label.setText("奖励图片无法读取。")
+            return
+        label.setPixmap(pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+
+class RewardAlbumDialog(QDialog):
+    """Memory album showing configured and unlocked rewards for the current character."""
+
+    def __init__(self, reward_manager: RewardManager, character_provider: Callable[[], object], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.reward_manager = reward_manager
+        self.character_provider = character_provider
+        self.setWindowTitle("回忆图鉴")
+        self.setObjectName("reportPanel")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET)
+        self.resize(760, 620)
+        self.title_label = QLabel("回忆图鉴")
+        self.title_label.setObjectName("panelTitle")
+        self.subtitle_label = QLabel("")
+        self.subtitle_label.setObjectName("panelSubtitle")
+        self.grid = QGridLayout()
+        self.grid.setSpacing(14)
+        body = QWidget()
+        body.setLayout(self.grid)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(body)
+        scroll.setFrameShape(QFrame.NoFrame)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.hide)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 22, 22, 22)
+        layout.setSpacing(12)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.subtitle_label)
+        layout.addWidget(scroll, 1)
+        layout.addWidget(close_button, 0, Qt.AlignRight)
+
+    def refresh(self) -> None:
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        character = self.character_provider()
+        character_id = getattr(character, "id", "koji")
+        character_name = getattr(character, "name", "Koji")
+        rewards = self.reward_manager.configured_rewards(character)
+        unlocked_count = sum(1 for reward in rewards if self.reward_manager.is_unlocked(character_id, reward.level))
+        self.subtitle_label.setText(f"{character_name} · 已解锁 {unlocked_count} / {len(rewards)}")
+        if not rewards:
+            empty = QLabel("这个角色还没有配置升级奖励。")
+            empty.setObjectName("panelSubtitle")
+            empty.setAlignment(Qt.AlignCenter)
+            self.grid.addWidget(empty, 0, 0)
+            return
+        for index, reward in enumerate(rewards):
+            self.grid.addWidget(self._create_card(reward), index // 2, index % 2)
+
+    def _create_card(self, reward: LevelReward) -> QFrame:
+        unlocked = self.reward_manager.is_unlocked(reward.character_id, reward.level)
+        record = self.reward_manager.unlocked_record(reward.character_id, reward.level)
+        card = QFrame()
+        card.setObjectName("moduleCard")
+        card.setMinimumHeight(210)
+        image_label = QLabel()
+        image_label.setAlignment(Qt.AlignCenter)
+        image_label.setFixedHeight(112)
+        if unlocked and reward.image_path is not None:
+            pixmap = QPixmap(str(reward.image_path))
+            if not pixmap.isNull():
+                image_label.setPixmap(pixmap.scaled(210, 110, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            image_label.setText(f"{'？？？' if not unlocked else '图片未放入'}\nLv{reward.level} 解锁")
+            image_label.setStyleSheet("QLabel { color: #9a8062; background: #eee4d5; border: 1px dashed #c8ad87; border-radius: 14px; }")
+        title = QLabel(reward.title if unlocked else "？？？")
+        title.setObjectName("sectionTitle")
+        meta_text = f"Lv{reward.level} · " + ((record or {}).get("unlocked_at", "已解锁") if unlocked else "未解锁")
+        meta = QLabel(meta_text)
+        meta.setObjectName("miniMeta")
+        desc = QLabel(reward.description if unlocked else "继续陪伴角色升级后解锁这张回忆。")
+        desc.setObjectName("panelSubtitle")
+        desc.setWordWrap(True)
+        button = QPushButton("查看大图" if unlocked else f"Lv{reward.level} 解锁")
+        button.setEnabled(unlocked)
+        button.clicked.connect(lambda checked=False, selected=reward, selected_record=record: self.open_preview(selected, selected_record))
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(7)
+        layout.addWidget(image_label)
+        layout.addWidget(title)
+        layout.addWidget(meta)
+        layout.addWidget(desc)
+        layout.addWidget(button)
+        return card
+
+    def open_preview(self, reward: LevelReward, record: dict | None) -> None:
+        dialog = RewardPreviewDialog(reward, record, self)
+        dialog.exec()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
+        self.hide()
+
+
+class UpgradeRewardDialog(QDialog):
+    """Reward-style popup shown immediately after a first-time level CG unlock."""
+
+    def __init__(self, reward: LevelReward, album_callback: Callable[[], None], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.reward = reward
+        self.album_callback = album_callback
+        self.setWindowTitle("升级奖励")
+        self.setObjectName("reportPanel")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET + "QDialog#reportPanel { background: rgba(255, 249, 239, 245); }")
+        self.resize(700, 650)
+        badge = QLabel("NEW · 升级奖励")
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setStyleSheet("QLabel { color: #8a5a00; background: #fff0c2; border: 1px solid #edcc87; border-radius: 14px; padding: 8px 12px; font-weight: 900; }")
+        level_label = QLabel(f"Lv{reward.level} 解锁")
+        level_label.setObjectName("panelTitle")
+        level_label.setAlignment(Qt.AlignCenter)
+        image_label = QLabel()
+        image_label.setAlignment(Qt.AlignCenter)
+        image_label.setMinimumHeight(330)
+        RewardPreviewDialog._set_reward_pixmap(self, image_label, reward.image_path, QSize(620, 340))
+        title = QLabel(reward.title)
+        title.setObjectName("panelTitle")
+        title.setAlignment(Qt.AlignCenter)
+        subtitle = QLabel(reward.subtitle)
+        subtitle.setObjectName("panelSubtitle")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setWordWrap(True)
+        description = QLabel(reward.description)
+        description.setObjectName("panelSubtitle")
+        description.setWordWrap(True)
+        description.setAlignment(Qt.AlignCenter)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        album_button = QPushButton("打开图鉴")
+        album_button.clicked.connect(self.open_album)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(close_button)
+        row.addWidget(album_button)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(26, 24, 26, 24)
+        layout.setSpacing(13)
+        layout.addWidget(badge, 0, Qt.AlignHCenter)
+        layout.addWidget(level_label)
+        layout.addWidget(image_label)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(description)
+        layout.addLayout(row)
+
+    def open_album(self) -> None:
+        self.album_callback()
+
+
 class ReportPanel(QDialog):
     def __init__(
         self,
@@ -975,6 +1188,7 @@ class ReportPanel(QDialog):
             ("和 Koji 聊两句", self.call_parent_chat),
             ("新建便签", self.call_parent_create_note),
             ("打开便签列表", self.call_parent_open_notes),
+            ("查看回忆图鉴", self.call_parent_open_rewards),
             ("开始番茄钟", self.call_parent_start_pomodoro),
             ("暂停/继续番茄钟", self.call_parent_toggle_pomodoro),
             ("停止番茄钟", self.call_parent_stop_pomodoro),
@@ -997,6 +1211,9 @@ class ReportPanel(QDialog):
 
     def call_parent_open_notes(self) -> None:
         self.call_parent_method("open_notes_list")
+
+    def call_parent_open_rewards(self) -> None:
+        self.call_parent_method("open_reward_album")
 
     def call_parent_start_pomodoro(self) -> None:
         self.call_parent_method("start_pomodoro")
@@ -1906,10 +2123,11 @@ class NotesListDialog(QDialog):
 class RelationshipPanel(QDialog):
     """Shows the current companion relationship level and progress."""
 
-    def __init__(self, relationship_manager: RelationshipManager, collection_callback: Callable[[], None], parent: QWidget | None = None) -> None:
+    def __init__(self, relationship_manager: RelationshipManager, collection_callback: Callable[[], None], reward_callback: Callable[[], None] | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.relationship_manager = relationship_manager
         self.collection_callback = collection_callback
+        self.reward_callback = reward_callback
         self.setWindowTitle("角色信息")
         self.setObjectName("reportPanel")
         self.setStyleSheet(REPORT_PANEL_STYLESHEET)
@@ -1926,11 +2144,14 @@ class RelationshipPanel(QDialog):
         self.tip_label.setWordWrap(True)
         collection_button = QPushButton("收藏柜")
         collection_button.clicked.connect(self.collection_callback)
+        rewards_button = QPushButton("回忆图鉴")
+        rewards_button.clicked.connect(self.reward_callback or self.hide)
         close_button = QPushButton("关闭")
         close_button.clicked.connect(self.hide)
 
         row = QHBoxLayout()
         row.addWidget(collection_button)
+        row.addWidget(rewards_button)
         row.addWidget(close_button)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -2055,6 +2276,7 @@ class KojiPet(QWidget):
         self.character_manager = CharacterManager()
         self.relationship_manager = RelationshipManager()
         self.collection_manager = CollectionManager()
+        self.reward_manager = RewardManager()
         self.current_character = self.character_manager.get(str(self.settings_manager.get("current_character", "koji")))
         self.ai_runtime = AIRuntimeManager()
         self.report_manager = ReportManager()
@@ -2074,6 +2296,9 @@ class KojiPet(QWidget):
         self.settings_dialog: SettingsDialog | None = None
         self.relationship_panel: RelationshipPanel | None = None
         self.collection_dialog: CollectionDialog | None = None
+        self.reward_album_dialog: RewardAlbumDialog | None = None
+        self.reward_popup: UpgradeRewardDialog | None = None
+        self.pending_reward_popups: list[LevelReward] = []
         self.notes_list_dialog: NotesListDialog | None = None
         self.note_windows: Dict[str, NoteCardWindow] = {}
         self.attached_window_follow_enabled = bool(self.settings_manager.get("attached_windows_follow_koji", True))
@@ -2098,7 +2323,7 @@ class KojiPet(QWidget):
         self.bubble = DialogueBubble()
         self.idle_timer = QTimer(self)
         self.idle_timer.setSingleShot(True)
-        self.idle_timer.timeout.connect(lambda: self.set_state("idle"))
+        self.idle_timer.timeout.connect(lambda: self.set_state("idle", force=True, show_dialogue=False))
 
         self.breath_animation = QVariantAnimation(self)
         self.breath_animation.setStartValue(0.0)
@@ -2158,12 +2383,27 @@ class KojiPet(QWidget):
         self.inactivity_timer.start(self.INACTIVITY_SLEEP_MS)
 
     def enter_sleep_from_inactivity(self) -> None:
-        if not self.is_dragging:
+        if not self.is_dragging and self.current_state == "idle" and self.reward_popup is None:
             self.set_state("sleep")
 
-    def set_state(self, state: str, show_dialogue: bool = True) -> None:
+    def can_transition_to_state(self, state: str) -> bool:
+        if state == "drag":
+            return True
+        if self.is_dragging or self.current_state == "drag":
+            return False
+        if state == "sleep":
+            return self.current_state == "idle" and self.reward_popup is None and not self.report_panel_is_busy()
+        if self.current_state in {"success", "error"} and state != "idle":
+            return False
+        return True
+
+    def set_state(self, state: str, show_dialogue: bool = True, force: bool = False) -> None:
         state = normalize_state(state)
+        if not force and not self.can_transition_to_state(state):
+            return
         previous_state = self.current_state
+        if state == previous_state:
+            return
         self.current_state = state
         self.visual.set_state(state)
         self.apply_visual_transform()
@@ -2174,14 +2414,19 @@ class KojiPet(QWidget):
         self.sync_animation_state()
         if self.report_panel is not None:
             self.report_panel.refresh_state_badge(state)
-        if state != previous_state and state in {"thinking", "typing", "success", "error"}:
+        if state in {"thinking", "typing", "success", "error", "happy"}:
             self.play_state_bounce()
 
     def temporary_state(self, state: str, milliseconds: int = 1800) -> None:
         self.mark_user_interaction()
         self.idle_timer.stop()
-        self.set_state(state)
-        if state != "idle":
+        normalized = normalize_state(state)
+        if normalized == "success" and milliseconds == 1800:
+            milliseconds = 3000
+        elif normalized == "error" and milliseconds == 1800:
+            milliseconds = 5000
+        self.set_state(normalized)
+        if normalized != "idle" and self.current_state == normalized:
             self.idle_timer.start(milliseconds)
 
     def start_idle_motion(self) -> None:
@@ -2272,6 +2517,8 @@ class KojiPet(QWidget):
         self.current_character = character
         self.settings_manager.set("current_character", character.id)
         self.visual.set_character(character)
+        if self.reward_album_dialog is not None:
+            self.reward_album_dialog.refresh()
         self.relationship_manager.ensure_character(character.id)
         self.relationship_manager.save()
         self.refresh_growth_windows()
@@ -2290,6 +2537,8 @@ class KojiPet(QWidget):
             self.relationship_panel.refresh(self.current_character)
         if self.collection_dialog is not None:
             self.collection_dialog.refresh()
+        if self.reward_album_dialog is not None:
+            self.reward_album_dialog.refresh()
         if self.report_panel is not None:
             self.report_panel.refresh_character_card()
 
@@ -2304,7 +2553,45 @@ class KojiPet(QWidget):
     def award_relationship_exp(self, amount: int) -> RelationshipChange:
         change = self.relationship_manager.add_exp(self.current_character_id(), amount)
         self.show_relationship_feedback(change)
+        self.handle_level_rewards(change)
         return change
+
+    def handle_level_rewards(self, change: RelationshipChange) -> None:
+        if not change.leveled_up or change.previous_level is None:
+            return
+        unlocked: list[LevelReward] = []
+        for level in range(change.previous_level + 1, change.level + 1):
+            reward = self.reward_manager.reward_for_level(self.current_character, level)
+            if reward is not None and self.reward_manager.unlock_reward(reward):
+                unlocked.append(reward)
+        if not unlocked:
+            return
+        self.pending_reward_popups.extend(unlocked)
+        if self.reward_album_dialog is not None:
+            self.reward_album_dialog.refresh()
+        self.temporary_state("success", 3000)
+        self.show_next_reward_popup()
+
+    def show_next_reward_popup(self) -> None:
+        if self.reward_popup is not None or not self.pending_reward_popups:
+            return
+        reward = self.pending_reward_popups.pop(0)
+        self.set_state("success", force=not self.is_dragging)
+        popup = UpgradeRewardDialog(reward, self.open_reward_album, self)
+        self.reward_popup = popup
+        popup.finished.connect(lambda _result: self.on_reward_popup_closed())
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
+
+    def on_reward_popup_closed(self) -> None:
+        self.reward_popup = None
+        if self.pending_reward_popups:
+            QTimer.singleShot(250, self.show_next_reward_popup)
+            return
+        if not self.is_dragging:
+            self.set_state("idle", show_dialogue=False, force=True)
+            self.schedule_random_idle_activity()
 
     def handle_collectible_unlock(self, result: UnlockResult) -> None:
         if not result.unlocked or result.collectible is None:
@@ -2332,7 +2619,7 @@ class KojiPet(QWidget):
 
     def open_relationship_panel(self) -> None:
         if self.relationship_panel is None:
-            self.relationship_panel = RelationshipPanel(self.relationship_manager, self.open_collection_dialog, self)
+            self.relationship_panel = RelationshipPanel(self.relationship_manager, self.open_collection_dialog, self.open_reward_album, self)
             self.register_attached_window(self.relationship_panel, "relationship")
         self.relationship_panel.refresh(self.current_character)
         self.relationship_panel.show()
@@ -2349,6 +2636,16 @@ class KojiPet(QWidget):
         self.position_attached_window(self.collection_dialog, force=True)
         self.collection_dialog.raise_()
         self.collection_dialog.activateWindow()
+
+    def open_reward_album(self) -> None:
+        if self.reward_album_dialog is None:
+            self.reward_album_dialog = RewardAlbumDialog(self.reward_manager, lambda: self.current_character, self)
+            self.register_attached_window(self.reward_album_dialog, "reward_album")
+        self.reward_album_dialog.refresh()
+        self.reward_album_dialog.show()
+        self.position_attached_window(self.reward_album_dialog, force=True)
+        self.reward_album_dialog.raise_()
+        self.reward_album_dialog.activateWindow()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if event.type() in {
@@ -2508,6 +2805,8 @@ class KojiPet(QWidget):
             self.is_dragging = True
             self.idle_timer.stop()
             self.stop_idle_motion()
+            self.idle_timer.stop()
+            self.random_idle_timer.stop()
             self.set_state("drag", show_dialogue=False)
             if self.animations_enabled:
                 self.drag_wobble_timer.start()
@@ -2536,7 +2835,8 @@ class KojiPet(QWidget):
             self.drag_wobble_timer.stop()
             self.drag_offset = 0
             self.apply_visual_transform()
-            self.set_state("idle", show_dialogue=not did_drag)
+            delay_ms = random.randint(300, 800) if did_drag else 0
+            QTimer.singleShot(delay_ms, lambda: self.set_state("idle", show_dialogue=not did_drag, force=True))
             if did_drag:
                 self.bubble.show_message(random_dialogue("drag"), self)
             if should_open:
@@ -2632,6 +2932,8 @@ class KojiPet(QWidget):
         relationship_action.triggered.connect(self.open_relationship_panel)
         collection_action = QAction("收藏柜", self)
         collection_action.triggered.connect(self.open_collection_dialog)
+        reward_album_action = QAction("回忆图鉴", self)
+        reward_album_action.triggered.connect(self.open_reward_album)
         animation_action = QAction("关闭动画" if self.animations_enabled else "开启动画", self)
         animation_action.triggered.connect(self.toggle_animations)
         start_pomodoro = QAction("开始番茄钟", self)
@@ -2658,6 +2960,7 @@ class KojiPet(QWidget):
         menu.addAction(ai_report)
         menu.addAction(relationship_action)
         menu.addAction(collection_action)
+        menu.addAction(reward_album_action)
         menu.addSeparator()
         for action in (start_pomodoro, pause_pomodoro, stop_pomodoro, pomodoro_settings):
             menu.addAction(action)

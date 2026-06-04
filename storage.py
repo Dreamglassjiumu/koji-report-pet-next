@@ -18,6 +18,7 @@ POMODORO_STATS_FILE = DATA_DIR / "pomodoro_stats.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 RELATIONSHIP_FILE = DATA_DIR / "relationship.json"
 COLLECTIBLES_FILE = DATA_DIR / "collectibles.json"
+REWARD_UNLOCKS_FILE = DATA_DIR / "reward_unlocks.json"
 
 
 def ensure_data_dir() -> None:

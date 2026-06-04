@@ -1,0 +1,25 @@
+{
+  "level_rewards": [
+    {
+      "level": 2,
+      "image": "lv2.png",
+      "title": "初次靠近",
+      "subtitle": "Koji 对你露出了更放松的笑容。",
+      "description": "恭喜升级到 Lv2，解锁纪念奖励图。"
+    },
+    {
+      "level": 3,
+      "image": "lv3.png",
+      "title": "熟悉的陪伴",
+      "subtitle": "你们的关系又近了一步。",
+      "description": "恭喜升级到 Lv3，解锁纪念奖励图。"
+    },
+    {
+      "level": 5,
+      "image": "lv5.png",
+      "title": "特别纪念",
+      "subtitle": "这是只属于你们的回忆。",
+      "description": "恭喜升级到 Lv5，解锁特别奖励图。"
+    }
+  ]
+}
