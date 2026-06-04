@@ -8,18 +8,10 @@ from datetime import date, datetime
 from typing import Dict, List
 from uuid import uuid4
 
+from category_manager import DEFAULT_CATEGORIES, UNCATEGORIZED
 from storage import RECORDS_FILE, load_json, save_json
 
-CATEGORIES = [
-    "pitch创作",
-    "物件包装",
-    "玩法包装",
-    "资料整理",
-    "会议总结",
-    "剧本创作",
-    "角色包装",
-    "文档处理",
-]
+CATEGORIES = DEFAULT_CATEGORIES
 
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 FRIDAY_WEEKDAY = 4
@@ -37,7 +29,8 @@ WORKDAY_AI_SYSTEM_PROMPT = """你是 Koji，一个文案组日报整理桌宠。
 写作要求：
 * 根据用户提供的记录进行整理、润色、归纳和适度扩写。
 * 目标总长度约 1200～1500 字；素材较少时也尽量写到 800 字以上。
-* 可以基于文案策划工作常识进行合理补足，例如资料整理、需求对齐、方案验证、表达优化、问题记录、后续跟进等。
+* 可以基于文案策划工作常识进行合理补足，例如资料整理、需求对齐、流程优化、方案验证、表达优化、问题记录、后续跟进等。
+* 输入记录前的方括号是用户选择的工作分类，请用于理解工作方向，但输出要自然归纳，不要机械堆分类名。
 * 不要凭空编造具体项目、具体会议、具体人员、具体结论或已经完成的交付结果。
 * “今日工作内容”重点写今天实际推进了什么。
 * “明日工作内容”根据今日记录推导明天可以继续做什么。
@@ -63,7 +56,8 @@ FRIDAY_AI_SYSTEM_PROMPT = """你是 Koji，一个文案组日报整理桌宠。�
 * “本周工作内容”要把用户记录包装成一周维度的阶段性推进，包括已完成、已验证、已整理、已沉淀、已发现的问题等。
 * “下周一工作内容”要根据本周工作自然推导下周一优先处理的事项。
 * “近期工作内容”写后续几天需要持续推进、优化、沟通、验证或沉淀的事项。
-* 可以基于文案策划工作常识进行合理补足，例如资料整理、需求对齐、方案验证、表达优化、问题记录、后续跟进等。
+* 可以基于文案策划工作常识进行合理补足，例如资料整理、需求对齐、流程优化、方案验证、表达优化、问题记录、后续跟进等。
+* 输入记录前的方括号是用户选择的工作分类，请用于理解工作方向，但输出要自然归纳，不要机械堆分类名。
 * 不要凭空编造具体项目、具体会议、具体人员、具体结论或已经完成的交付结果。
 * 不要输出“今日完成”“进行中”“明日计划”“风险与待确认”等标题。
 * 表达要像游戏公司文案策划自己的日报，具体、体面、自然，不要客服腔，不要空话套话。
@@ -132,7 +126,7 @@ class ReportRecord:
             return cls(
                 id=str(data["id"]),
                 date=str(data["date"]),
-                category=str(data["category"]),
+                category=str(data.get("category") or UNCATEGORIZED),
                 content=str(data["content"]),
                 time=str(data.get("time") or data.get("created_at") or ""),
             )
@@ -168,7 +162,7 @@ class ReportManager:
         record = ReportRecord(
             id=uuid4().hex,
             date=record_date or date.today().isoformat(),
-            category=category.strip() or CATEGORIES[0],
+            category=category.strip() or UNCATEGORIZED,
             content=cleaned,
             time=datetime.now().strftime("%H:%M"),
         )
@@ -193,7 +187,7 @@ class ReportManager:
         record = self.get_record(record_id)
         if record is None:
             raise ValueError("这条记录已经不存在了。")
-        record.category = category.strip() or CATEGORIES[0]
+        record.category = category.strip() or UNCATEGORIZED
         record.content = cleaned
         if not record.time:
             record.time = datetime.now().strftime("%H:%M")
@@ -204,12 +198,22 @@ class ReportManager:
         self.records = [record for record in self.records if record.id != record_id]
         self.save()
 
+    def rename_category_in_records(self, old_name: str, new_name: str) -> int:
+        changed = 0
+        for record in self.records:
+            if record.category == old_name:
+                record.category = new_name
+                changed += 1
+        if changed:
+            self.save()
+        return changed
+
     def clear_date(self, record_date: str | None = None) -> None:
         target = record_date or date.today().isoformat()
         self.records = [record for record in self.records if record.date != target]
         self.save()
 
-    def render_template_report(self, record_date: str | None = None) -> str:
+    def render_template_report(self, record_date: str | None = None, categories: List[str] | None = None) -> str:
         records = self.records_for_date(record_date)
         report_date = local_report_date(record_date)
         target = report_date.isoformat()
@@ -222,7 +226,8 @@ class ReportManager:
 
         titles = report_section_titles(target)
         lines = [f"{target} 日报（{weekday_name(report_date)}）", "", titles[0]]
-        ordered_categories = CATEGORIES + [category for category in grouped if category not in CATEGORIES]
+        category_order = categories or CATEGORIES
+        ordered_categories = category_order + [category for category in grouped if category not in category_order]
         for category in ordered_categories:
             items = grouped.get(category)
             if not items:

@@ -13,6 +13,7 @@ CHAT_HISTORY_FILE = DATA_DIR / "chat_history.json"
 DIALOGUES_FILE = DATA_DIR / "koji-dialogues.json"
 NOTES_FILE = DATA_DIR / "notes.json"
 TAGS_FILE = DATA_DIR / "tags.json"
+CATEGORIES_FILE = DATA_DIR / "categories.json"
 POMODORO_STATS_FILE = DATA_DIR / "pomodoro_stats.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 
