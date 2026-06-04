@@ -5,6 +5,7 @@ import math
 import os
 import random
 import sys
+import zipfile
 from datetime import date
 from typing import Callable, Dict
 
@@ -40,8 +41,9 @@ from PySide6.QtWidgets import (
 
 from ai_runtime_manager import AIRuntimeManager, AI_UNAVAILABLE_MESSAGE, READY_MESSAGE, STARTING_MESSAGE, STATUS_LABELS
 from category_manager import CategoryManager
+from character_manager import CharacterManager
 from chat_manager import ChatManager
-from koji_state import STATES, KojiVisual, random_dialogue
+from koji_state import STATES, KojiVisual, normalize_state, random_dialogue
 from report_manager import ReportManager, clean_ai_report_text, format_record_line
 from hourly_chime_manager import HourlyChimeManager
 from notes_manager import Note, NotesManager
@@ -270,7 +272,8 @@ class ChatDialog(QDialog):
         self.cancel_button.setEnabled(True)
         parent = self.parent()
         if parent is not None and hasattr(parent, "temporary_state"):
-            parent.temporary_state("thinking")  # type: ignore[attr-defined]
+            parent.temporary_state("thinking", 900)  # type: ignore[attr-defined]
+            QTimer.singleShot(900, lambda: parent.temporary_state("typing", 60_000) if not self.send_button.isEnabled() else None)  # type: ignore[attr-defined]
         self.chat_thread = run_in_qthread(
             self,
             lambda: self.chat_manager.chat(text, unavailable_reply=CHAT_UNAVAILABLE_REPLY),
@@ -287,7 +290,7 @@ class ChatDialog(QDialog):
         self.typing_label.setVisible(False)
         parent = self.parent()
         if parent is not None and hasattr(parent, "temporary_state"):
-            parent.temporary_state("happy" if ok else "confused")  # type: ignore[attr-defined]
+            parent.temporary_state("success" if ok else "error", 3000 if ok else 5000)  # type: ignore[attr-defined]
         self.refresh()
 
     def cancel_message(self) -> None:
@@ -298,7 +301,7 @@ class ChatDialog(QDialog):
         self.typing_label.setVisible(False)
         parent = self.parent()
         if parent is not None and hasattr(parent, "temporary_state"):
-            parent.temporary_state("confused")  # type: ignore[attr-defined]
+            parent.temporary_state("error", 5000)  # type: ignore[attr-defined]
 
     def clear_history(self) -> None:
         self.chat_manager.clear()
@@ -622,7 +625,8 @@ class ReportPanel(QDialog):
 
     def notify_state(self, state: str) -> None:
         if self.state_callback is not None:
-            self.state_callback(state)
+            duration = 3000 if normalize_state(state) == "success" else 5000 if normalize_state(state) == "error" else 1800
+            self.state_callback(state, duration)
 
     def show_koji_message(self, message: str) -> None:
         self.ai_notice.setText(message)
@@ -797,6 +801,7 @@ class ReportPanel(QDialog):
         self.ai_button.setEnabled(False)
         self.cancel_ai_button.setEnabled(True)
         self.notify_state("thinking")
+        QTimer.singleShot(900, lambda: self.notify_state("typing") if not self.ai_button.isEnabled() else None)
         self.show_koji_message("Koji 正在认真憋日报，高质量模型可能需要 1～3 分钟。")
         self.ai_wait_60_timer = QTimer.singleShot(60000, self.show_ai_wait_60_message)
         self.ai_wait_180_timer = QTimer.singleShot(180000, self.show_ai_wait_180_message)
@@ -837,7 +842,7 @@ class ReportPanel(QDialog):
         ok, answer = result if isinstance(result, tuple) and len(result) >= 2 else (False, "本地 AI 返回了未知结果。")
         if ok:
             self.report_text.setPlainText(clean_ai_report_text(str(answer)))
-            self.notify_state("happy")
+            self.notify_state("success")
             self.show_koji_message("日报炼成完毕，去交差吧。")
             return
         self.notify_state("error")
@@ -1093,12 +1098,13 @@ class TagManageDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, settings_manager: SettingsManager, pomodoro: PomodoroManager, tag_manager: TagManager, notes_manager: NotesManager, parent: QWidget | None = None) -> None:
+    def __init__(self, settings_manager: SettingsManager, pomodoro: PomodoroManager, tag_manager: TagManager, notes_manager: NotesManager, character_manager: CharacterManager, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.settings_manager = settings_manager
         self.pomodoro = pomodoro
         self.tag_manager = tag_manager
         self.notes_manager = notes_manager
+        self.character_manager = character_manager
         self.setWindowTitle("Koji 设置")
         self.setObjectName("reportPanel")
         self.setStyleSheet(REPORT_PANEL_STYLESHEET)
@@ -1116,6 +1122,11 @@ class SettingsDialog(QDialog):
         self.focus = QSpinBox(); self.focus.setRange(1, 180); self.focus.setValue(int(settings_manager.get("pomodoro_focus_minutes", 25)))
         self.short_break = QSpinBox(); self.short_break.setRange(1, 60); self.short_break.setValue(int(settings_manager.get("pomodoro_short_break_minutes", 5)))
         self.long_break = QSpinBox(); self.long_break.setRange(1, 120); self.long_break.setValue(int(settings_manager.get("pomodoro_long_break_minutes", 15)))
+        self.character_combo = QComboBox()
+        self.refresh_character_combo()
+        self.character_combo.currentIndexChanged.connect(self.change_character)
+        import_character_button = QPushButton("导入角色")
+        import_character_button.clicked.connect(self.import_character)
         tag_button = QPushButton("打开 Tag 管理")
         tag_button.clicked.connect(self.open_tags)
         save_button = QPushButton("保存设置")
@@ -1129,11 +1140,55 @@ class SettingsDialog(QDialog):
         form.addRow("专注分钟", self.focus)
         form.addRow("短休息分钟", self.short_break)
         form.addRow("长休息分钟", self.long_break)
+        character_row = QHBoxLayout()
+        character_row.addWidget(self.character_combo, 1)
+        character_row.addWidget(import_character_button)
+        form.addRow("当前角色", character_row)
         form.addRow("Tag", tag_button)
         form.addRow("本地 AI", QLabel("运行器优先：ai-runtime/koboldcpp.exe\n模型：ai-runtime/model.gguf 或 ai-runtime/models/*.gguf\n所有数据仅保存在本地 data/ 目录。"))
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(save_button)
+
+    def refresh_character_combo(self) -> None:
+        current_id = str(self.settings_manager.get("current_character", "koji"))
+        self.character_manager.refresh()
+        self.character_combo.blockSignals(True)
+        self.character_combo.clear()
+        selected_index = 0
+        for index, character in enumerate(self.character_manager.all_characters()):
+            self.character_combo.addItem(character.name, character.id)
+            if character.id == current_id:
+                selected_index = index
+        if self.character_combo.count() > 0:
+            self.character_combo.setCurrentIndex(selected_index)
+        self.character_combo.blockSignals(False)
+
+    def change_character(self) -> None:
+        character_id = self.character_combo.currentData()
+        if not character_id:
+            return
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "select_character"):
+            parent.select_character(str(character_id))  # type: ignore[attr-defined]
+
+    def import_character(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "导入角色", "", "角色包 (*.zip)")
+        if not path:
+            return
+        try:
+            character = self.character_manager.import_zip(path)
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            QMessageBox.information(self, "Koji", f"导入失败：{exc}")
+            return
+        self.refresh_character_combo()
+        index = self.character_combo.findData(character.id)
+        if index >= 0:
+            self.character_combo.setCurrentIndex(index)
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "select_character"):
+            parent.select_character(character.id)  # type: ignore[attr-defined]
+        QMessageBox.information(self, "Koji", f"已导入角色：{character.name}")
 
     def open_tags(self) -> None:
         dialog = TagManageDialog(self.tag_manager, self.notes_manager, self)
@@ -1353,13 +1408,15 @@ class KojiPet(QWidget):
     PET_SIZE = QSize(152, 152)
     VISUAL_SIZE = QSize(132, 132)
     BREATH_AMPLITUDE = 4
-    RANDOM_IDLE_STATES = ("wave", "thinking", "happy", "sleep")
-    RANDOM_IDLE_MIN_MS = 20_000
-    RANDOM_IDLE_MAX_MS = 40_000
+    RANDOM_IDLE_MIN_MS = 30_000
+    RANDOM_IDLE_MAX_MS = 90_000
+    INACTIVITY_SLEEP_MS = 15 * 60 * 1000
 
     def __init__(self) -> None:
         super().__init__()
         self.settings_manager = SettingsManager()
+        self.character_manager = CharacterManager()
+        self.current_character = self.character_manager.get(str(self.settings_manager.get("current_character", "koji")))
         self.ai_runtime = AIRuntimeManager()
         self.report_manager = ReportManager()
         self.category_manager = CategoryManager()
@@ -1424,6 +1481,10 @@ class KojiPet(QWidget):
         self.random_idle_timer.setSingleShot(True)
         self.random_idle_timer.timeout.connect(self.trigger_random_idle_activity)
 
+        self.inactivity_timer = QTimer(self)
+        self.inactivity_timer.setSingleShot(True)
+        self.inactivity_timer.timeout.connect(self.enter_sleep_from_inactivity)
+
         self.setWindowTitle("Koji Report Pet Next")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -1431,21 +1492,35 @@ class KojiPet(QWidget):
         self.customContextMenuRequested.connect(self.show_context_menu)
 
         self.label = QLabel(self)
-        self.visual = KojiVisual(self.label, self.VISUAL_SIZE)
+        self.visual = KojiVisual(self.label, self.VISUAL_SIZE, self.current_character)
         self.setFixedSize(self.PET_SIZE)
         self.apply_visual_transform()
         self.set_state("idle")
         self.start_idle_motion()
         self.schedule_random_idle_activity()
+        self.reset_inactivity_timer()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self.open_visible_notes()
 
     def mark_user_interaction(self) -> None:
+        was_sleeping = self.current_state == "sleep"
+        self.reset_inactivity_timer()
+        if was_sleeping:
+            self.set_state("idle")
         self.schedule_random_idle_activity()
         self.open_visible_notes()
 
+    def reset_inactivity_timer(self) -> None:
+        self.inactivity_timer.start(self.INACTIVITY_SLEEP_MS)
+
+    def enter_sleep_from_inactivity(self) -> None:
+        if not self.is_dragging:
+            self.set_state("sleep")
+
     def set_state(self, state: str, show_dialogue: bool = True) -> None:
-        if state not in STATES:
-            state = "idle"
+        state = normalize_state(state)
         previous_state = self.current_state
         self.current_state = state
         self.visual.set_state(state)
@@ -1455,7 +1530,7 @@ class KojiPet(QWidget):
             self.setToolTip(dialogue)
             self.bubble.show_message(dialogue, self)
         self.sync_animation_state()
-        if state != previous_state and state in {"collect", "success", "happy", "confused", "error", "writing"}:
+        if state != previous_state and state in {"thinking", "typing", "success", "error"}:
             self.play_state_bounce()
 
     def temporary_state(self, state: str, milliseconds: int = 1800) -> None:
@@ -1542,9 +1617,34 @@ class KojiPet(QWidget):
         if not self.animations_enabled or self.current_state != "idle" or self.is_dragging or self.report_panel_is_busy():
             self.schedule_random_idle_activity()
             return
-        state = random.choice(self.RANDOM_IDLE_STATES)
-        duration = random.randint(2_000, 4_000)
-        self.temporary_state(state, duration)
+        self.visual.show_random_idle_variant()
+        self.schedule_random_idle_activity()
+
+    def select_character(self, character_id: str) -> None:
+        self.character_manager.refresh()
+        character = self.character_manager.get(character_id)
+        if character is None:
+            return
+        self.current_character = character
+        self.settings_manager.set("current_character", character.id)
+        self.visual.set_character(character)
+        self.set_state(self.current_state, show_dialogue=False)
+        self.setToolTip(random_dialogue(self.current_state))
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if event.type() in {
+            QEvent.MouseButtonPress,
+            QEvent.MouseButtonRelease,
+            QEvent.MouseMove,
+            QEvent.KeyPress,
+            QEvent.Wheel,
+            QEvent.TouchBegin,
+        }:
+            was_sleeping = self.current_state == "sleep"
+            self.reset_inactivity_timer()
+            if was_sleeping:
+                self.set_state("idle")
+        return super().eventFilter(watched, event)
 
 
     def set_animations_enabled(self, enabled: bool) -> None:
@@ -1599,7 +1699,7 @@ class KojiPet(QWidget):
         self.pomodoro_window.activateWindow()
 
     def open_settings_dialog(self) -> None:
-        self.settings_dialog = SettingsDialog(self.settings_manager, self.pomodoro_manager, self.tag_manager, self.notes_manager, self)
+        self.settings_dialog = SettingsDialog(self.settings_manager, self.pomodoro_manager, self.tag_manager, self.notes_manager, self.character_manager, self)
         self.register_attached_window(self.settings_dialog, "settings")
         self.settings_dialog.show()
         self.position_attached_window(self.settings_dialog, force=True)
@@ -1858,7 +1958,7 @@ class KojiPet(QWidget):
         menu.exec(self.mapToGlobal(position))
 
     def open_report_panel(self) -> None:
-        self.temporary_state("wave")
+        self.temporary_state("idle")
         if self.report_panel is None:
             self.report_panel = ReportPanel(self.report_manager, self.ai_runtime, self.category_manager, self.temporary_state, self)
             self.register_attached_window(self.report_panel, "report")
@@ -1870,7 +1970,7 @@ class KojiPet(QWidget):
         self.report_panel.activateWindow()
 
     def open_chat_dialog(self) -> None:
-        self.temporary_state("happy")
+        self.temporary_state("success")
         if self.chat_dialog is None:
             self.chat_dialog = ChatDialog(self.chat_manager, self)
             self.register_attached_window(self.chat_dialog, "chat")
@@ -1895,7 +1995,7 @@ class KojiPet(QWidget):
             self.report_panel.generate_ai()
 
     def shutdown(self) -> None:
-        for timer in (self.idle_timer, self.drag_wobble_timer, self.random_idle_timer):
+        for timer in (self.idle_timer, self.drag_wobble_timer, self.random_idle_timer, self.inactivity_timer):
             timer.stop()
         self.breath_animation.stop()
         self.bounce_animation.stop()
