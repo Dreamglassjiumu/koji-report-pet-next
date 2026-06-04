@@ -14,8 +14,42 @@ from storage import ROOT_DIR
 
 CHARACTERS_DIR = ROOT_DIR / "assets" / "characters"
 CHARACTER_JSON = "character.json"
-COMPANION_STATES = ["idle", "thinking", "typing", "success", "error", "sleep"]
-ASSET_EXTENSIONS = ("png", "webp", "gif")
+COMPANION_STATES = [
+    "idle",
+    "thinking",
+    "typing",
+    "success",
+    "error",
+    "sleep",
+    "drag",
+    "happy",
+    "confused",
+    "angry",
+    "writing",
+    "collect",
+    "record_ready",
+    "wave",
+]
+COMMON_STATE_ASSETS = [
+    "idle",
+    "thinking",
+    "typing",
+    "writing",
+    "success",
+    "error",
+    "sleep",
+    "drag",
+    "happy",
+    "confused",
+    "angry",
+    "collect",
+    "record_ready",
+    "wave",
+    "idle_01",
+    "idle_02",
+    "idle_03",
+]
+ASSET_EXTENSIONS = ("png", "jpg", "jpeg", "webp", "gif")
 _SAFE_ID_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 
 
@@ -46,9 +80,10 @@ class CharacterPackage:
                     continue
                 if path.exists() and path.is_file():
                     return path
-        avatar = self.directory / "avatar.png"
-        if avatar.exists() and avatar.is_file():
-            return avatar
+        for extension in ASSET_EXTENSIONS:
+            avatar = self.directory / f"avatar.{extension}"
+            if avatar.exists() and avatar.is_file():
+                return avatar
         return None
 
     def idle_variants(self) -> list[Path]:
