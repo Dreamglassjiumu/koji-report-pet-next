@@ -13,7 +13,7 @@ if not os.environ.get("DISPLAY") and sys.platform.startswith("linux"):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QAbstractAnimation, QEvent, QObject, QPoint, QSize, Qt, QThread, QTime, QTimer, QUrl, Signal, QVariantAnimation
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QGuiApplication
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QGuiApplication, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFormLayout,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QInputDialog,
@@ -30,11 +31,13 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QPlainTextEdit,
     QScrollArea,
     QSpinBox,
     QTimeEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -107,6 +110,53 @@ QPushButton:hover {
 }
 QPushButton:pressed {
     background: #f3bd6a;
+}
+
+QFrame#moduleCard, QFrame#characterCard, QFrame#workspaceCard {
+    background: rgba(255, 250, 238, 238);
+    border: 1px solid #ead8bf;
+    border-radius: 18px;
+}
+QFrame#moduleCard:hover, QFrame#characterCard:hover, QFrame#workspaceCard:hover {
+    border-color: #e7c28b;
+}
+QLabel#sectionTitle {
+    color: #5c3b25;
+    font-size: 16px;
+    font-weight: 800;
+}
+QLabel#miniMeta {
+    color: #8a6a52;
+    font-size: 12px;
+}
+QProgressBar {
+    color: #5c3b25;
+    background: #f6e7d1;
+    border: 1px solid #e5c79f;
+    border-radius: 8px;
+    height: 14px;
+    text-align: center;
+    font-weight: 700;
+}
+QProgressBar::chunk {
+    background: #f0b35c;
+    border-radius: 7px;
+}
+QToolButton#accordionHeader {
+    color: #4b3324;
+    background: #fff0cf;
+    border: 1px solid #ead8bf;
+    border-radius: 12px;
+    padding: 9px 10px;
+    font-size: 14px;
+    font-weight: 800;
+    text-align: left;
+}
+QToolButton#accordionHeader:hover {
+    background: #ffe6b8;
+}
+QPushButton#toolbarButton {
+    padding: 8px 12px;
 }
 """
 
@@ -419,12 +469,186 @@ class CategoryManageDialog(QDialog):
 
 
 
+
+class CollapsibleSection(QWidget):
+    """Small accordion section used by the workspace side panel."""
+
+    def __init__(self, title: str, content: QWidget, expanded: bool = False, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.title = title
+        self.content = content
+        self.toggle_button = QToolButton()
+        self.toggle_button.setObjectName("accordionHeader")
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(expanded)
+        self.toggle_button.clicked.connect(self.set_expanded)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(self.toggle_button)
+        layout.addWidget(self.content)
+        self.set_expanded(expanded)
+
+    def set_expanded(self, expanded: bool) -> None:
+        self.toggle_button.setChecked(expanded)
+        self.toggle_button.setText(("▼ " if expanded else "▶ ") + self.title)
+        self.content.setVisible(expanded)
+
+
+class CharacterCard(QFrame):
+    """Always-visible companion identity and relationship summary."""
+
+    def __init__(self, relationship_manager: RelationshipManager, collection_manager: CollectionManager, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.relationship_manager = relationship_manager
+        self.collection_manager = collection_manager
+        self.setObjectName("characterCard")
+
+        self.avatar = QLabel("Koji")
+        self.avatar.setAlignment(Qt.AlignCenter)
+        self.avatar.setFixedSize(116, 116)
+        self.avatar.setStyleSheet("QLabel { background: #fff0cf; border: 1px solid #ead0a0; border-radius: 58px; color: #8a5a00; font-weight: 900; }")
+        self.name_label = QLabel("Koji")
+        self.name_label.setObjectName("panelTitle")
+        self.name_label.setAlignment(Qt.AlignCenter)
+        self.level_label = QLabel("Lv1 陌生")
+        self.level_label.setStyleSheet("QLabel { color: #5c3b25; font-size: 18px; font-weight: 900; }")
+        self.level_label.setAlignment(Qt.AlignCenter)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.exp_label = QLabel("0 / 50")
+        self.exp_label.setObjectName("miniMeta")
+        self.exp_label.setAlignment(Qt.AlignCenter)
+        self.collection_label = QLabel("收藏：0 / 0")
+        self.collection_label.setObjectName("miniMeta")
+        self.collection_label.setAlignment(Qt.AlignCenter)
+        self.tip_label = QLabel("下一次日报、聊天或番茄钟都会让信任慢慢增长。")
+        self.tip_label.setObjectName("panelSubtitle")
+        self.tip_label.setWordWrap(True)
+        self.tip_label.setAlignment(Qt.AlignCenter)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+        layout.addWidget(self.avatar, 0, Qt.AlignHCenter)
+        layout.addWidget(self.name_label)
+        layout.addWidget(self.level_label)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.exp_label)
+        layout.addWidget(self.collection_label)
+        layout.addWidget(self.tip_label)
+        layout.addStretch(1)
+
+    def refresh(self, character) -> None:
+        character_id = getattr(character, "id", "koji")
+        character_name = getattr(character, "name", "Koji")
+        self.name_label.setText(character_name)
+        self.avatar.setText(character_name[:8])
+        asset_path = character.state_asset("idle") if character is not None else None
+        if asset_path is not None:
+            pixmap = QPixmap(str(asset_path))
+            if not pixmap.isNull():
+                self.avatar.setPixmap(pixmap.scaled(96, 96, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                self.avatar.setPixmap(QPixmap())
+        else:
+            self.avatar.setPixmap(QPixmap())
+        self.level_label.setText(self.relationship_manager.level_label(character_id))
+        level, exp = self.relationship_manager.get(character_id)
+        if level >= 5:
+            self.progress.setValue(100)
+            self.exp_label.setText("MAX")
+            self.tip_label.setText("已经是最可靠的工作搭档了。")
+        else:
+            threshold = LEVEL_THRESHOLDS[level]
+            self.progress.setValue(int(exp / threshold * 100) if threshold else 0)
+            self.exp_label.setText(f"{exp} / {threshold}")
+            remaining = max(0, threshold - exp)
+            self.tip_label.setText(f"距离下一等级还差 {remaining} 经验。")
+        total = len(self.collection_manager.all_collectibles())
+        self.collection_label.setText(f"收藏：{len(self.collection_manager.unlocked_ids())} / {total}")
+
+
+class CollectionCabinetWidget(QFrame):
+    """Inline collection cabinet for the workspace function center."""
+
+    def __init__(self, collection_manager: CollectionManager, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.collection_manager = collection_manager
+        self.setObjectName("moduleCard")
+        self.list_widget = QListWidget()
+        self.list_widget.currentItemChanged.connect(lambda _current, _previous: self.refresh_detail())
+        self.name_label = QLabel("？？？")
+        self.name_label.setObjectName("sectionTitle")
+        self.icon_label = QLabel("图标：？？？")
+        self.icon_label.setObjectName("miniMeta")
+        self.description_label = QLabel("选择收藏品查看详情。")
+        self.description_label.setObjectName("panelSubtitle")
+        self.description_label.setWordWrap(True)
+
+        detail = QVBoxLayout()
+        detail.setContentsMargins(0, 0, 0, 0)
+        detail.setSpacing(6)
+        detail.addWidget(self.name_label)
+        detail.addWidget(self.icon_label)
+        detail.addWidget(self.description_label)
+        detail.addStretch(1)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("已获得收藏品会显示真实信息，未获得保持神秘。"))
+        layout.addWidget(self.list_widget, 1)
+        layout.addLayout(detail)
+        self.refresh()
+
+    def refresh(self) -> None:
+        current_id = self.list_widget.currentItem().data(Qt.UserRole) if self.list_widget.currentItem() else None
+        self.list_widget.clear()
+        selected_row = 0
+        for row, collectible in enumerate(self.collection_manager.all_collectibles()):
+            unlocked = self.collection_manager.is_unlocked(collectible.id)
+            label = f"{collectible.icon} {collectible.name}" if unlocked and collectible.icon else collectible.name if unlocked else "？？？"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, collectible.id)
+            self.list_widget.addItem(item)
+            if collectible.id == current_id:
+                selected_row = row
+        if self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(selected_row)
+        self.refresh_detail()
+
+    def refresh_detail(self) -> None:
+        item = self.list_widget.currentItem()
+        if item is None:
+            self.name_label.setText("？？？")
+            self.icon_label.setText("图标：？？？")
+            self.description_label.setText("暂无收藏品。")
+            return
+        collectible_id = str(item.data(Qt.UserRole) or "")
+        collectible = self.collection_manager.load_collectible(collectible_id)
+        if collectible is None or not self.collection_manager.is_unlocked(collectible_id):
+            self.name_label.setText("？？？")
+            self.icon_label.setText("图标：？？？")
+            self.description_label.setText("尚未获得。")
+            return
+        self.name_label.setText(collectible.name)
+        self.icon_label.setText(f"图标：{collectible.icon or '无'}")
+        self.description_label.setText(collectible.description)
+
+
 class ReportPanel(QDialog):
     def __init__(
         self,
         report_manager: ReportManager,
         ai_runtime: AIRuntimeManager,
         category_manager: CategoryManager,
+        tag_manager: TagManager,
+        notes_manager: NotesManager,
+        relationship_manager: RelationshipManager,
+        collection_manager: CollectionManager,
         state_callback: Callable[[str], None] | None = None,
         report_success_callback: Callable[[], None] | None = None,
         parent: QWidget | None = None,
@@ -433,17 +657,22 @@ class ReportPanel(QDialog):
         self.report_manager = report_manager
         self.ai_runtime = ai_runtime
         self.category_manager = category_manager
+        self.tag_manager = tag_manager
+        self.notes_manager = notes_manager
+        self.relationship_manager = relationship_manager
+        self.collection_manager = collection_manager
         self.state_callback = state_callback
         self.report_success_callback = report_success_callback
         self.record_ids: Dict[int, str] = {}
         self.setWindowTitle("Koji 日报面板")
-        self.resize(860, 760)
+        self.resize(1180, 780)
+        self.setMinimumSize(980, 640)
         self.setObjectName("reportPanel")
         self.setStyleSheet(REPORT_PANEL_STYLESHEET)
 
         self.title_label = QLabel("Koji 日报面板")
         self.title_label.setObjectName("panelTitle")
-        self.subtitle_label = QLabel("Koji 会帮你把零散工作痕迹整理成日报。")
+        self.subtitle_label = QLabel(f"当前角色：{self.current_character_name()} · 日期：{date.today().isoformat()}")
         self.subtitle_label.setObjectName("panelSubtitle")
         self.ai_notice = QLabel("")
         self.ai_notice.setObjectName("aiNotice")
@@ -458,9 +687,9 @@ class ReportPanel(QDialog):
         self.model_description.setWordWrap(True)
         self.switch_model_button = QPushButton("切换模型")
         self.switch_model_button.clicked.connect(self.switch_model)
-        open_models_button = QPushButton("打开模型文件夹")
+        open_models_button = QPushButton("模型文件夹")
         open_models_button.clicked.connect(self.open_models_folder)
-        refresh_models_button = QPushButton("刷新模型列表")
+        refresh_models_button = QPushButton("刷新模型")
         refresh_models_button.clicked.connect(self.refresh_model_list)
         restart_ai_button = QPushButton("重启 Koji 脑子")
         restart_ai_button.clicked.connect(self.restart_ai)
@@ -471,25 +700,18 @@ class ReportPanel(QDialog):
         self.ai_detail = QLabel("")
         self.ai_detail.setWordWrap(True)
         self.ai_detail.setVisible(False)
-        detail_button = QPushButton("显示/隐藏高级信息")
+        detail_button = QPushButton("高级信息")
         detail_button.clicked.connect(lambda: self.ai_detail.setVisible(not self.ai_detail.isVisible()))
-        model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("当前模型："))
-        model_row.addWidget(self.model_combo, 1)
-        for button in (self.switch_model_button, open_models_button, refresh_models_button):
-            model_row.addWidget(button)
 
-        ai_status_row = QHBoxLayout()
-        ai_status_row.addWidget(self.ai_status_label, 1)
-        for button in (restart_ai_button, close_ai_button, check_ai_button, detail_button):
-            ai_status_row.addWidget(button)
-        self.refresh_model_list()
-        self.refresh_ai_notice()
+        self.character_card = CharacterCard(self.relationship_manager, self.collection_manager)
+        self.character_card.setMinimumWidth(210)
+        self.character_card.setMaximumWidth(260)
 
-        self.date_label = QLabel(f"日期：{date.today().isoformat()}")
+        self.date_label = QLabel(f"今日工作 · {date.today().isoformat()}")
+        self.date_label.setObjectName("sectionTitle")
         self.category = QComboBox()
         self.refresh_category_combo()
-        manage_category_button = QPushButton("管理分类")
+        manage_category_button = QPushButton("分类")
         manage_category_button.clicked.connect(self.open_category_manager)
         self.content = QLineEdit()
         self.content.setMinimumHeight(34)
@@ -506,52 +728,206 @@ class ReportPanel(QDialog):
         self.records_list = QListWidget()
         self.records_list.setObjectName("recordsList")
         self.records_list.itemDoubleClicked.connect(self.edit_record_item)
-        delete_button = QPushButton("删除记录")
+        delete_button = QPushButton("删除")
         delete_button.clicked.connect(self.delete_record)
         copy_record_button = QPushButton("复制记录")
         copy_record_button.clicked.connect(self.copy_record)
-        clear_button = QPushButton("清空今日记录")
+        clear_button = QPushButton("清空")
         clear_button.clicked.connect(self.clear_today)
-        template_button = QPushButton("普通模板整理日报")
+        template_button = QPushButton("普通整理")
         template_button.clicked.connect(self.generate_template)
-        self.ai_button = QPushButton("AI 整理日报")
+        self.ai_button = QPushButton("AI 整理")
         self.ai_button.clicked.connect(self.generate_ai)
         self.cancel_ai_button = QPushButton("取消生成")
         self.cancel_ai_button.setEnabled(False)
         self.cancel_ai_button.clicked.connect(self.cancel_ai_generation)
-        copy_button = QPushButton("复制日报")
+        copy_button = QPushButton("复制")
         copy_button.clicked.connect(self.copy_report)
-        export_txt_button = QPushButton("导出 .txt")
+        export_txt_button = QPushButton("导出 TXT")
         export_txt_button.clicked.connect(lambda: self.export_records("txt"))
-        export_md_button = QPushButton("导出 .md")
+        export_md_button = QPushButton("导出 MD")
         export_md_button.clicked.connect(lambda: self.export_records("md"))
 
         button_row = QHBoxLayout()
-        for button in (delete_button, copy_record_button, clear_button, template_button, self.ai_button, self.cancel_ai_button, copy_button, export_txt_button, export_md_button):
+        button_row.setSpacing(8)
+        for button in (self.ai_button, template_button, copy_button, export_txt_button, export_md_button, copy_record_button, delete_button, clear_button, self.cancel_ai_button):
+            button.setObjectName("toolbarButton")
             button_row.addWidget(button)
+        button_row.addStretch(1)
 
         self.report_text = QPlainTextEdit()
         self.report_text.setObjectName("reportText")
         self.report_text.setPlaceholderText("整理后的日报会显示在这里，可继续编辑。")
 
+        workspace_card = QFrame()
+        workspace_card.setObjectName("workspaceCard")
+        workspace = QVBoxLayout(workspace_card)
+        workspace.setContentsMargins(16, 16, 16, 16)
+        workspace.setSpacing(10)
+        workspace.addWidget(self.date_label)
+        workspace.addLayout(input_row)
+        workspace.addWidget(QLabel("今日记录："))
+        workspace.addWidget(self.records_list, 3)
+        workspace.addLayout(button_row)
+        workspace.addWidget(QLabel("日报草稿："))
+        workspace.addWidget(self.report_text, 4)
+
+        self.collection_widget = CollectionCabinetWidget(self.collection_manager)
+        tag_panel = self.create_button_panel("便签 Tag 入口", [("打开 Tag 管理", self.open_tag_manager), ("打开便签列表", self.call_parent_open_notes)])
+        category_panel = self.create_button_panel("日报分类入口", [("打开分类管理", self.open_category_manager)])
+        ai_panel = self.create_ai_settings_panel(open_models_button, refresh_models_button, restart_ai_button, close_ai_button, check_ai_button, detail_button)
+        system_panel = self.create_system_panel()
+
+        function_scroll_body = QWidget()
+        function_layout = QVBoxLayout(function_scroll_body)
+        function_layout.setContentsMargins(0, 0, 0, 0)
+        function_layout.setSpacing(10)
+        function_layout.addWidget(CollapsibleSection("收藏柜", self.collection_widget, True))
+        function_layout.addWidget(CollapsibleSection("Tag 管理", tag_panel, False))
+        function_layout.addWidget(CollapsibleSection("分类管理", category_panel, False))
+        function_layout.addWidget(CollapsibleSection("AI 设置", ai_panel, False))
+        function_layout.addWidget(CollapsibleSection("系统设置", system_panel, False))
+        function_layout.addStretch(1)
+
+        function_scroll = QScrollArea()
+        function_scroll.setWidgetResizable(True)
+        function_scroll.setWidget(function_scroll_body)
+        function_scroll.setFrameShape(QFrame.NoFrame)
+        function_scroll.setMinimumWidth(260)
+        function_scroll.setMaximumWidth(320)
+        function_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+
+        header = QHBoxLayout()
+        header.addWidget(self.title_label)
+        header.addStretch(1)
+        header.addWidget(self.subtitle_label)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        body.addWidget(self.character_card, 0)
+        body.addWidget(workspace_card, 1)
+        body.addWidget(function_scroll, 0)
+        body.setStretch(0, 1)
+        body.setStretch(1, 4)
+        body.setStretch(2, 1)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
         layout.setSpacing(12)
-        layout.addWidget(self.title_label)
-        layout.addWidget(self.subtitle_label)
+        layout.addLayout(header)
         layout.addWidget(self.ai_notice)
-        layout.addLayout(model_row)
-        layout.addWidget(self.model_description)
-        layout.addLayout(ai_status_row)
-        layout.addWidget(self.ai_detail)
-        layout.addWidget(self.date_label)
-        layout.addLayout(input_row)
-        layout.addWidget(QLabel("今日记录："))
-        layout.addWidget(self.records_list, 1)
-        layout.addLayout(button_row)
-        layout.addWidget(QLabel("日报草稿："))
-        layout.addWidget(self.report_text, 2)
+        layout.addLayout(body, 1)
+
+        self.refresh_model_list()
+        self.refresh_ai_notice()
         self.refresh_records()
+        self.refresh_character_card()
+
+
+    def parent_pet(self):
+        parent = self.parent()
+        return parent if parent is not None else None
+
+    def current_character(self):
+        parent = self.parent_pet()
+        return getattr(parent, "current_character", None)
+
+    def current_character_name(self) -> str:
+        character = self.current_character()
+        return getattr(character, "name", "Koji") or "Koji"
+
+    def refresh_character_card(self) -> None:
+        self.subtitle_label.setText(f"当前角色：{self.current_character_name()} · 日期：{date.today().isoformat()}")
+        self.character_card.refresh(self.current_character())
+        if hasattr(self, "collection_widget"):
+            self.collection_widget.refresh()
+
+    def create_button_panel(self, hint: str, buttons: list[tuple[str, Callable[[], None]]]) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("moduleCard")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        label = QLabel(hint)
+        label.setObjectName("panelSubtitle")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        for title, callback in buttons:
+            button = QPushButton(title)
+            button.clicked.connect(callback)
+            layout.addWidget(button)
+        return panel
+
+    def create_ai_settings_panel(self, open_models_button: QPushButton, refresh_models_button: QPushButton, restart_ai_button: QPushButton, close_ai_button: QPushButton, check_ai_button: QPushButton, detail_button: QPushButton) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("moduleCard")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("当前模型"))
+        layout.addWidget(self.model_combo)
+        layout.addWidget(self.switch_model_button)
+        row = QHBoxLayout()
+        row.addWidget(open_models_button)
+        row.addWidget(refresh_models_button)
+        layout.addLayout(row)
+        layout.addWidget(self.model_description)
+        layout.addWidget(self.ai_status_label)
+        for button in (restart_ai_button, close_ai_button, check_ai_button, detail_button):
+            layout.addWidget(button)
+        layout.addWidget(self.ai_detail)
+        return panel
+
+    def create_system_panel(self) -> QFrame:
+        callbacks = [
+            ("和 Koji 聊两句", self.call_parent_chat),
+            ("新建便签", self.call_parent_create_note),
+            ("打开便签列表", self.call_parent_open_notes),
+            ("开始番茄钟", self.call_parent_start_pomodoro),
+            ("暂停/继续番茄钟", self.call_parent_toggle_pomodoro),
+            ("停止番茄钟", self.call_parent_stop_pomodoro),
+            ("系统设置", self.call_parent_settings),
+            ("切换动画", self.call_parent_toggle_animations),
+        ]
+        return self.create_button_panel("常用系统功能入口；右键菜单保留，但这里可直接打开。", callbacks)
+
+    def call_parent_method(self, method_name: str) -> None:
+        parent = self.parent_pet()
+        method = getattr(parent, method_name, None)
+        if callable(method):
+            method()
+
+    def call_parent_chat(self) -> None:
+        self.call_parent_method("open_chat_dialog")
+
+    def call_parent_create_note(self) -> None:
+        self.call_parent_method("create_note")
+
+    def call_parent_open_notes(self) -> None:
+        self.call_parent_method("open_notes_list")
+
+    def call_parent_start_pomodoro(self) -> None:
+        self.call_parent_method("start_pomodoro")
+
+    def call_parent_toggle_pomodoro(self) -> None:
+        parent = self.parent_pet()
+        pomodoro = getattr(parent, "pomodoro_manager", None)
+        if pomodoro is not None and hasattr(pomodoro, "toggle_pause"):
+            pomodoro.toggle_pause()
+
+    def call_parent_stop_pomodoro(self) -> None:
+        self.call_parent_method("stop_pomodoro")
+
+    def call_parent_settings(self) -> None:
+        self.call_parent_method("open_settings_dialog")
+
+    def call_parent_toggle_animations(self) -> None:
+        self.call_parent_method("toggle_animations")
+
+    def open_tag_manager(self) -> None:
+        dialog = TagManageDialog(self.tag_manager, self.notes_manager, self)
+        dialog.exec()
+
 
 
     def refresh_category_combo(self) -> None:
@@ -1820,11 +2196,13 @@ class KojiPet(QWidget):
             self.relationship_panel.refresh(self.current_character)
         if self.collection_dialog is not None:
             self.collection_dialog.refresh()
+        if self.report_panel is not None:
+            self.report_panel.refresh_character_card()
 
     def show_relationship_feedback(self, change: RelationshipChange) -> None:
         self.refresh_growth_windows()
         if change.leveled_up:
-            message = f"关系等级提升：{change.level_name}"
+            message = f"{self.current_character_name()} 对你的信任提升了。"
         else:
             message = f"{self.current_character_name()} 对你的信任提升了。"
         self.bubble.show_message(message, self, 3200)
@@ -2214,10 +2592,11 @@ class KojiPet(QWidget):
     def open_report_panel(self) -> None:
         self.temporary_state("idle")
         if self.report_panel is None:
-            self.report_panel = ReportPanel(self.report_manager, self.ai_runtime, self.category_manager, self.temporary_state, self.on_report_generated_success, self)
+            self.report_panel = ReportPanel(self.report_manager, self.ai_runtime, self.category_manager, self.tag_manager, self.notes_manager, self.relationship_manager, self.collection_manager, self.temporary_state, self.on_report_generated_success, self)
             self.register_attached_window(self.report_panel, "report")
         self.report_panel.refresh_ai_notice()
         self.report_panel.refresh_records()
+        self.report_panel.refresh_character_card()
         self.report_panel.show()
         self.position_attached_window(self.report_panel, force=True)
         self.report_panel.raise_()
