@@ -39,9 +39,10 @@ from PySide6.QtWidgets import (
 )
 
 from ai_runtime_manager import AIRuntimeManager, AI_UNAVAILABLE_MESSAGE, READY_MESSAGE, STARTING_MESSAGE, STATUS_LABELS
+from category_manager import CategoryManager
 from chat_manager import ChatManager
 from koji_state import STATES, KojiVisual, random_dialogue
-from report_manager import CATEGORIES, ReportManager, clean_ai_report_text, format_record_line
+from report_manager import ReportManager, clean_ai_report_text, format_record_line
 from hourly_chime_manager import HourlyChimeManager
 from notes_manager import Note, NotesManager
 from pomodoro_manager import PHASE_FOCUS, PomodoroManager
@@ -197,7 +198,7 @@ class ChatDialog(QDialog):
         self.messages_widget = QWidget()
         self.messages_layout = QVBoxLayout(self.messages_widget)
         self.messages_layout.setContentsMargins(10, 10, 10, 10)
-        self.messages_layout.setSpacing(8)
+        self.messages_layout.setSpacing(10)
         self.messages_layout.addStretch(1)
 
         self.history_view = QScrollArea()
@@ -208,6 +209,9 @@ class ChatDialog(QDialog):
             "QScrollArea#chatScroll { background: rgba(255, 250, 238, 210); border: 1px solid #ead8bf; border-radius: 14px; }"
             "QScrollArea#chatScroll QWidget { background: transparent; }"
         )
+        self.typing_label = QLabel("Koji 正在憋话……")
+        self.typing_label.setObjectName("panelSubtitle")
+        self.typing_label.setVisible(False)
 
         self.input = ChatInput(self.send_message)
         self.send_button = QPushButton("发送")
@@ -231,6 +235,7 @@ class ChatDialog(QDialog):
         layout.addWidget(title)
         layout.addWidget(hint)
         layout.addWidget(self.history_view, 1)
+        layout.addWidget(self.typing_label)
         layout.addLayout(bottom)
         self.refresh()
 
@@ -260,7 +265,8 @@ class ChatDialog(QDialog):
             return
         self.input.clear()
         self.send_button.setEnabled(False)
-        self.send_button.setText("思考中...")
+        self.send_button.setText("Koji 正在憋话……")
+        self.typing_label.setVisible(True)
         self.cancel_button.setEnabled(True)
         parent = self.parent()
         if parent is not None and hasattr(parent, "temporary_state"):
@@ -278,6 +284,7 @@ class ChatDialog(QDialog):
         self.send_button.setEnabled(True)
         self.send_button.setText("发送")
         self.cancel_button.setEnabled(False)
+        self.typing_label.setVisible(False)
         parent = self.parent()
         if parent is not None and hasattr(parent, "temporary_state"):
             parent.temporary_state("happy" if ok else "confused")  # type: ignore[attr-defined]
@@ -288,6 +295,7 @@ class ChatDialog(QDialog):
         self.send_button.setEnabled(True)
         self.send_button.setText("发送")
         self.cancel_button.setEnabled(False)
+        self.typing_label.setVisible(False)
         parent = self.parent()
         if parent is not None and hasattr(parent, "temporary_state"):
             parent.temporary_state("confused")  # type: ignore[attr-defined]
@@ -301,18 +309,107 @@ class ChatDialog(QDialog):
         self.hide()
 
 
+class CategoryManageDialog(QDialog):
+    def __init__(self, category_manager: CategoryManager, report_manager: ReportManager | None = None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.category_manager = category_manager
+        self.report_manager = report_manager
+        self.setWindowTitle("分类管理")
+        self.setObjectName("reportPanel")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET)
+        self.resize(430, 420)
+        self.list_widget = QListWidget()
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self.rename_selected())
+        add_button = QPushButton("新增分类")
+        add_button.clicked.connect(self.add_category)
+        rename_button = QPushButton("重命名")
+        rename_button.clicked.connect(self.rename_selected)
+        delete_button = QPushButton("删除")
+        delete_button.clicked.connect(self.delete_selected)
+        restore_button = QPushButton("恢复默认")
+        restore_button.clicked.connect(self.restore_defaults)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        for button in (add_button, rename_button, delete_button, restore_button, close_button):
+            row.addWidget(button)
+        layout = QVBoxLayout(self)
+        tip = QLabel("日报分类：双击可重命名。删除分类不会删除已有记录；已记录内容会保留原分类文本。")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+        layout.addWidget(self.list_widget, 1)
+        layout.addLayout(row)
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.list_widget.clear()
+        for category in self.category_manager.all_categories():
+            item = QListWidgetItem(category)
+            item.setData(Qt.UserRole, category)
+            self.list_widget.addItem(item)
+
+    def selected_category(self) -> str | None:
+        item = self.list_widget.currentItem()
+        return str(item.data(Qt.UserRole)) if item is not None else None
+
+    def add_category(self) -> None:
+        name, ok = QInputDialog.getText(self, "新增分类", "分类名称：")
+        if not ok:
+            return
+        try:
+            self.category_manager.add_category(name)
+        except ValueError as exc:
+            QMessageBox.information(self, "Koji", str(exc))
+        self.refresh()
+
+    def rename_selected(self) -> None:
+        old_name = self.selected_category()
+        if not old_name:
+            return
+        name, ok = QInputDialog.getText(self, "重命名分类", "分类名称：", text=old_name)
+        if not ok:
+            return
+        try:
+            old_cleaned, new_cleaned = self.category_manager.rename_category(old_name, name)
+            if self.report_manager is not None:
+                self.report_manager.rename_category_in_records(old_cleaned, new_cleaned)
+        except ValueError as exc:
+            QMessageBox.information(self, "Koji", str(exc))
+        self.refresh()
+
+    def delete_selected(self) -> None:
+        category = self.selected_category()
+        if not category:
+            return
+        if QMessageBox.question(self, "Koji", f"确定删除分类「{category}」吗？已有记录不会被删除，会保留原分类文本。") != QMessageBox.Yes:
+            return
+        try:
+            self.category_manager.delete_category(category)
+        except ValueError as exc:
+            QMessageBox.information(self, "Koji", str(exc))
+        self.refresh()
+
+    def restore_defaults(self) -> None:
+        if QMessageBox.question(self, "Koji", "确定恢复默认分类吗？自定义分类会被替换，但已有记录不会被删除。") != QMessageBox.Yes:
+            return
+        self.category_manager.restore_defaults()
+        self.refresh()
+
+
 
 class ReportPanel(QDialog):
     def __init__(
         self,
         report_manager: ReportManager,
         ai_runtime: AIRuntimeManager,
+        category_manager: CategoryManager,
         state_callback: Callable[[str], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.report_manager = report_manager
         self.ai_runtime = ai_runtime
+        self.category_manager = category_manager
         self.state_callback = state_callback
         self.record_ids: Dict[int, str] = {}
         self.setWindowTitle("Koji 日报面板")
@@ -367,7 +464,9 @@ class ReportPanel(QDialog):
 
         self.date_label = QLabel(f"日期：{date.today().isoformat()}")
         self.category = QComboBox()
-        self.category.addItems(CATEGORIES)
+        self.refresh_category_combo()
+        manage_category_button = QPushButton("管理分类")
+        manage_category_button.clicked.connect(self.open_category_manager)
         self.content = QLineEdit()
         self.content.setMinimumHeight(34)
         self.content.setPlaceholderText("输入今天完成的事项……")
@@ -376,6 +475,7 @@ class ReportPanel(QDialog):
 
         input_row = QHBoxLayout()
         input_row.addWidget(self.category)
+        input_row.addWidget(manage_category_button)
         input_row.addWidget(self.content, 1)
         input_row.addWidget(add_button)
 
@@ -427,6 +527,24 @@ class ReportPanel(QDialog):
         layout.addLayout(button_row)
         layout.addWidget(QLabel("日报草稿："))
         layout.addWidget(self.report_text, 2)
+        self.refresh_records()
+
+
+    def refresh_category_combo(self) -> None:
+        current = self.category.currentText() if hasattr(self, "category") else ""
+        self.category.blockSignals(True)
+        self.category.clear()
+        self.category.addItems(self.category_manager.all_categories())
+        if current:
+            index = self.category.findText(current)
+            if index >= 0:
+                self.category.setCurrentIndex(index)
+        self.category.blockSignals(False)
+
+    def open_category_manager(self) -> None:
+        dialog = CategoryManageDialog(self.category_manager, self.report_manager, self)
+        dialog.exec()
+        self.refresh_category_combo()
         self.refresh_records()
 
     def refresh_model_list(self) -> None:
@@ -582,7 +700,7 @@ class ReportPanel(QDialog):
         dialog.setWindowTitle("编辑记录")
         dialog.setStyleSheet(self.styleSheet())
         category = QComboBox(dialog)
-        category.addItems(CATEGORIES)
+        category.addItems(self.category_manager.all_categories())
         category.setCurrentText(record.category)
         content = QLineEdit(record.content, dialog)
         content.setMinimumHeight(34)
@@ -655,7 +773,7 @@ class ReportPanel(QDialog):
             self.report_text.setPlainText("素材不足：请先添加今日记录，Koji 再帮你整理日报。")
             self.notify_state("confused")
             return
-        report = self.report_manager.render_template_report()
+        report = self.report_manager.render_template_report(categories=self.category_manager.all_categories())
         self.report_text.setPlainText(report)
         self.notify_state("happy")
 
@@ -1012,7 +1130,7 @@ class SettingsDialog(QDialog):
         form.addRow("短休息分钟", self.short_break)
         form.addRow("长休息分钟", self.long_break)
         form.addRow("Tag", tag_button)
-        form.addRow("本地 AI", QLabel("运行器：ai-runtime/llama-server.exe\n模型：ai-runtime/model.gguf\n所有数据仅保存在本地 data/ 目录。"))
+        form.addRow("本地 AI", QLabel("运行器优先：ai-runtime/koboldcpp.exe\n模型：ai-runtime/model.gguf 或 ai-runtime/models/*.gguf\n所有数据仅保存在本地 data/ 目录。"))
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(save_button)
@@ -1244,7 +1362,8 @@ class KojiPet(QWidget):
         self.settings_manager = SettingsManager()
         self.ai_runtime = AIRuntimeManager()
         self.report_manager = ReportManager()
-        self.chat_manager = ChatManager(self.ai_runtime)
+        self.category_manager = CategoryManager()
+        self.chat_manager = ChatManager(self.ai_runtime, self.category_manager)
         self.tag_manager = TagManager()
         self.notes_manager = NotesManager()
         self.pomodoro_manager = PomodoroManager(self.settings_manager)
@@ -1741,7 +1860,7 @@ class KojiPet(QWidget):
     def open_report_panel(self) -> None:
         self.temporary_state("wave")
         if self.report_panel is None:
-            self.report_panel = ReportPanel(self.report_manager, self.ai_runtime, self.temporary_state, self)
+            self.report_panel = ReportPanel(self.report_manager, self.ai_runtime, self.category_manager, self.temporary_state, self)
             self.register_attached_window(self.report_panel, "report")
         self.report_panel.refresh_ai_notice()
         self.report_panel.refresh_records()

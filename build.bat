@@ -37,10 +37,14 @@ mkdir "%PORTABLE_DIR%\ai-runtime" 2>nul
 if exist ai-runtime\.gitkeep copy /y ai-runtime\.gitkeep "%PORTABLE_DIR%\ai-runtime\.gitkeep" >nul
 if exist ai-runtime\README_AI_RUNTIME.txt copy /y ai-runtime\README_AI_RUNTIME.txt "%PORTABLE_DIR%\ai-runtime\README_AI_RUNTIME.txt" >nul
 
+if exist ai-runtime\koboldcpp.exe (
+  copy /y ai-runtime\koboldcpp.exe "%PORTABLE_DIR%\ai-runtime\koboldcpp.exe" >nul
+) else (
+  echo [Koji] Missing ai-runtime\koboldcpp.exe. Add it manually before publishing AI package.
+)
+
 if exist ai-runtime\llama-server.exe (
   copy /y ai-runtime\llama-server.exe "%PORTABLE_DIR%\ai-runtime\llama-server.exe" >nul
-) else (
-  echo [Koji] Missing ai-runtime\llama-server.exe. Add it manually before publishing AI package.
 )
 
 if exist ai-runtime\models (
@@ -65,6 +69,9 @@ if exist README_本地AI版说明.md copy /y README_本地AI版说明.md "%PORTA
 > "%PORTABLE_DIR%\启动 Koji.bat" echo @echo off
 >> "%PORTABLE_DIR%\启动 Koji.bat" echo cd /d "%%~dp0"
 >> "%PORTABLE_DIR%\启动 Koji.bat" echo start "" "%APP_NAME%.exe"
+
+if not exist "%PORTABLE_DIR%\ai-runtime\koboldcpp.exe" echo [Koji] Warning: portable package has no koboldcpp.exe.
+if not exist "%PORTABLE_DIR%\ai-runtime\model.gguf" if not exist "%PORTABLE_DIR%\ai-runtime\models\*.gguf" echo [Koji] Warning: portable package has no GGUF model.
 
 echo [Koji] Portable package ready: %PORTABLE_DIR%
 endlocal
