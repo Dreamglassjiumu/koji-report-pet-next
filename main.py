@@ -41,10 +41,21 @@ from PySide6.QtWidgets import (
 
 from ai_runtime_manager import AIRuntimeManager, AI_UNAVAILABLE_MESSAGE, READY_MESSAGE, STARTING_MESSAGE, STATUS_LABELS
 from category_manager import CategoryManager
+from collection_manager import CollectionManager, UnlockResult
 from character_manager import CharacterManager
 from chat_manager import ChatManager
 from koji_state import STATES, KojiVisual, normalize_state, random_dialogue
 from report_manager import ReportManager, clean_ai_report_text, format_record_line
+from relationship_manager import (
+    EXP_CHARACTER_IMPORT,
+    EXP_CHAT_SUCCESS,
+    EXP_DAILY_CHECK_IN,
+    EXP_POMODORO_DONE,
+    EXP_REPORT_SUCCESS,
+    LEVEL_THRESHOLDS,
+    RelationshipChange,
+    RelationshipManager,
+)
 from hourly_chime_manager import HourlyChimeManager
 from notes_manager import Note, NotesManager
 from pomodoro_manager import PHASE_FOCUS, PomodoroManager
@@ -183,9 +194,15 @@ class ChatMessageBubble(QWidget):
 
 
 class ChatDialog(QDialog):
-    def __init__(self, chat_manager: ChatManager, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        chat_manager: ChatManager,
+        success_callback: Callable[[], None] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.chat_manager = chat_manager
+        self.success_callback = success_callback
         self.setWindowTitle("和 Koji 聊两句")
         self.setObjectName("reportPanel")
         self.setStyleSheet(REPORT_PANEL_STYLESHEET)
@@ -291,6 +308,8 @@ class ChatDialog(QDialog):
         parent = self.parent()
         if parent is not None and hasattr(parent, "temporary_state"):
             parent.temporary_state("success" if ok else "error", 3000 if ok else 5000)  # type: ignore[attr-defined]
+        if ok and self.success_callback is not None:
+            self.success_callback()
         self.refresh()
 
     def cancel_message(self) -> None:
@@ -407,6 +426,7 @@ class ReportPanel(QDialog):
         ai_runtime: AIRuntimeManager,
         category_manager: CategoryManager,
         state_callback: Callable[[str], None] | None = None,
+        report_success_callback: Callable[[], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -414,6 +434,7 @@ class ReportPanel(QDialog):
         self.ai_runtime = ai_runtime
         self.category_manager = category_manager
         self.state_callback = state_callback
+        self.report_success_callback = report_success_callback
         self.record_ids: Dict[int, str] = {}
         self.setWindowTitle("Koji 日报面板")
         self.resize(860, 760)
@@ -635,6 +656,10 @@ class ReportPanel(QDialog):
         if parent is not None and hasattr(parent, "bubble"):
             parent.bubble.show_message(message, parent)  # type: ignore[attr-defined]
 
+    def notify_report_success(self) -> None:
+        if self.report_success_callback is not None:
+            self.report_success_callback()
+
     def refresh_ai_notice(self) -> None:
         status = self.ai_runtime.refresh_status()
         message = self.ai_runtime.status_message()
@@ -780,6 +805,7 @@ class ReportPanel(QDialog):
         report = self.report_manager.render_template_report(categories=self.category_manager.all_categories())
         self.report_text.setPlainText(report)
         self.notify_state("happy")
+        self.notify_report_success()
 
     def generate_ai(self) -> None:
         if not self.ai_button.isEnabled():
@@ -844,6 +870,7 @@ class ReportPanel(QDialog):
             self.report_text.setPlainText(clean_ai_report_text(str(answer)))
             self.notify_state("success")
             self.show_koji_message("日报炼成完毕，去交差吧。")
+            self.notify_report_success()
             return
         self.notify_state("error")
         self.show_koji_message(f"AI 整理日报失败：{answer}\n普通模板日报仍然可用，原始记录不会丢失。")
@@ -1098,13 +1125,14 @@ class TagManageDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, settings_manager: SettingsManager, pomodoro: PomodoroManager, tag_manager: TagManager, notes_manager: NotesManager, character_manager: CharacterManager, parent: QWidget | None = None) -> None:
+    def __init__(self, settings_manager: SettingsManager, pomodoro: PomodoroManager, tag_manager: TagManager, notes_manager: NotesManager, character_manager: CharacterManager, relationship_manager: RelationshipManager, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.settings_manager = settings_manager
         self.pomodoro = pomodoro
         self.tag_manager = tag_manager
         self.notes_manager = notes_manager
         self.character_manager = character_manager
+        self.relationship_manager = relationship_manager
         self.setWindowTitle("Koji 设置")
         self.setObjectName("reportPanel")
         self.setStyleSheet(REPORT_PANEL_STYLESHEET)
@@ -1188,6 +1216,8 @@ class SettingsDialog(QDialog):
         parent = self.parent()
         if parent is not None and hasattr(parent, "select_character"):
             parent.select_character(character.id)  # type: ignore[attr-defined]
+        if parent is not None and hasattr(parent, "award_relationship_exp"):
+            parent.award_relationship_exp(EXP_CHARACTER_IMPORT)  # type: ignore[attr-defined]
         QMessageBox.information(self, "Koji", f"已导入角色：{character.name}")
 
     def open_tags(self) -> None:
@@ -1404,6 +1434,145 @@ class NotesListDialog(QDialog):
         self.refresh()
 
 
+
+class RelationshipPanel(QDialog):
+    """Shows the current companion relationship level and progress."""
+
+    def __init__(self, relationship_manager: RelationshipManager, collection_callback: Callable[[], None], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.relationship_manager = relationship_manager
+        self.collection_callback = collection_callback
+        self.setWindowTitle("角色信息")
+        self.setObjectName("reportPanel")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET)
+        self.resize(360, 260)
+
+        self.name_label = QLabel("")
+        self.name_label.setObjectName("panelTitle")
+        self.level_label = QLabel("")
+        self.level_label.setStyleSheet("QLabel { color: #5c3b25; font-size: 18px; font-weight: 800; }")
+        self.exp_label = QLabel("")
+        self.exp_label.setObjectName("panelSubtitle")
+        self.tip_label = QLabel("关系经验会随日报、聊天、番茄钟和签到慢慢增长。")
+        self.tip_label.setObjectName("panelSubtitle")
+        self.tip_label.setWordWrap(True)
+        collection_button = QPushButton("收藏柜")
+        collection_button.clicked.connect(self.collection_callback)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.hide)
+
+        row = QHBoxLayout()
+        row.addWidget(collection_button)
+        row.addWidget(close_button)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+        layout.addWidget(self.name_label)
+        layout.addWidget(self.level_label)
+        layout.addWidget(self.exp_label)
+        layout.addWidget(self.tip_label)
+        layout.addStretch(1)
+        layout.addLayout(row)
+
+    def refresh(self, character) -> None:
+        character_id = getattr(character, "id", "koji")
+        character_name = getattr(character, "name", "Koji")
+        self.name_label.setText(character_name)
+        self.level_label.setText(self.relationship_manager.level_label(character_id))
+        level, exp = self.relationship_manager.get(character_id)
+        exp_text = "MAX" if level >= 5 else f"{exp} / {LEVEL_THRESHOLDS[level]}"
+        self.exp_label.setText(exp_text)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
+        self.hide()
+
+
+class CollectionDialog(QDialog):
+    """Collection cabinet for unlocked companion keepsakes."""
+
+    def __init__(self, collection_manager: CollectionManager, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.collection_manager = collection_manager
+        self.setWindowTitle("收藏柜")
+        self.setObjectName("reportPanel")
+        self.setStyleSheet(REPORT_PANEL_STYLESHEET)
+        self.resize(520, 380)
+
+        title = QLabel("收藏柜")
+        title.setObjectName("panelTitle")
+        hint = QLabel("已获得的纪念物会显示真实信息；未获得的会保持神秘感。")
+        hint.setObjectName("panelSubtitle")
+        hint.setWordWrap(True)
+        self.list_widget = QListWidget()
+        self.list_widget.currentItemChanged.connect(lambda _current, _previous: self.refresh_detail())
+        self.name_label = QLabel("？？？")
+        self.name_label.setStyleSheet("QLabel { color: #5c3b25; font-size: 18px; font-weight: 800; }")
+        self.description_label = QLabel("选择一个收藏品查看详情。")
+        self.description_label.setWordWrap(True)
+        self.description_label.setObjectName("panelSubtitle")
+        self.icon_label = QLabel("图标：？？？")
+        self.icon_label.setObjectName("panelSubtitle")
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.hide)
+
+        detail = QVBoxLayout()
+        detail.addWidget(self.name_label)
+        detail.addWidget(self.icon_label)
+        detail.addWidget(self.description_label, 1)
+        detail.addWidget(close_button)
+        body = QHBoxLayout()
+        body.addWidget(self.list_widget, 1)
+        body.addLayout(detail, 1)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+        layout.addWidget(title)
+        layout.addWidget(hint)
+        layout.addLayout(body, 1)
+        self.refresh()
+
+    def refresh(self) -> None:
+        current_id = None
+        current = self.list_widget.currentItem()
+        if current is not None:
+            current_id = current.data(Qt.UserRole)
+        self.list_widget.clear()
+        selected_row = 0
+        for row, collectible in enumerate(self.collection_manager.all_collectibles()):
+            unlocked = self.collection_manager.is_unlocked(collectible.id)
+            item = QListWidgetItem(collectible.name if unlocked else "？？？")
+            item.setData(Qt.UserRole, collectible.id)
+            self.list_widget.addItem(item)
+            if collectible.id == current_id:
+                selected_row = row
+        if self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(selected_row)
+        self.refresh_detail()
+
+    def refresh_detail(self) -> None:
+        item = self.list_widget.currentItem()
+        if item is None:
+            self.name_label.setText("？？？")
+            self.description_label.setText("暂无收藏品。")
+            self.icon_label.setText("图标：？？？")
+            return
+        collectible_id = str(item.data(Qt.UserRole) or "")
+        collectible = self.collection_manager.load_collectible(collectible_id)
+        if collectible is None or not self.collection_manager.is_unlocked(collectible_id):
+            self.name_label.setText("？？？")
+            self.description_label.setText("尚未获得。")
+            self.icon_label.setText("图标：？？？")
+            return
+        self.name_label.setText(collectible.name)
+        self.description_label.setText(collectible.description)
+        self.icon_label.setText(f"图标：{collectible.icon or '无'}")
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
+        self.hide()
+
+
 class KojiPet(QWidget):
     PET_SIZE = QSize(152, 152)
     VISUAL_SIZE = QSize(132, 132)
@@ -1416,6 +1585,8 @@ class KojiPet(QWidget):
         super().__init__()
         self.settings_manager = SettingsManager()
         self.character_manager = CharacterManager()
+        self.relationship_manager = RelationshipManager()
+        self.collection_manager = CollectionManager()
         self.current_character = self.character_manager.get(str(self.settings_manager.get("current_character", "koji")))
         self.ai_runtime = AIRuntimeManager()
         self.report_manager = ReportManager()
@@ -1433,6 +1604,8 @@ class KojiPet(QWidget):
         self.chat_dialog: ChatDialog | None = None
         self.pomodoro_window: PomodoroWindow | None = None
         self.settings_dialog: SettingsDialog | None = None
+        self.relationship_panel: RelationshipPanel | None = None
+        self.collection_dialog: CollectionDialog | None = None
         self.notes_list_dialog: NotesListDialog | None = None
         self.note_windows: Dict[str, NoteCardWindow] = {}
         self.attached_window_follow_enabled = bool(self.settings_manager.get("attached_windows_follow_koji", True))
@@ -1503,6 +1676,7 @@ class KojiPet(QWidget):
         if app is not None:
             app.installEventFilter(self)
         self.open_visible_notes()
+        self.handle_daily_check_in()
 
     def mark_user_interaction(self) -> None:
         was_sleeping = self.current_state == "sleep"
@@ -1628,8 +1802,81 @@ class KojiPet(QWidget):
         self.current_character = character
         self.settings_manager.set("current_character", character.id)
         self.visual.set_character(character)
+        self.relationship_manager.ensure_character(character.id)
+        self.relationship_manager.save()
+        self.refresh_growth_windows()
         self.set_state(self.current_state, show_dialogue=False)
         self.setToolTip(random_dialogue(self.current_state))
+
+
+    def current_character_id(self) -> str:
+        return getattr(self.current_character, "id", "koji") or "koji"
+
+    def current_character_name(self) -> str:
+        return getattr(self.current_character, "name", "Koji") or "Koji"
+
+    def refresh_growth_windows(self) -> None:
+        if self.relationship_panel is not None:
+            self.relationship_panel.refresh(self.current_character)
+        if self.collection_dialog is not None:
+            self.collection_dialog.refresh()
+
+    def show_relationship_feedback(self, change: RelationshipChange) -> None:
+        self.refresh_growth_windows()
+        if change.leveled_up:
+            message = f"关系等级提升：{change.level_name}"
+        else:
+            message = f"{self.current_character_name()} 对你的信任提升了。"
+        self.bubble.show_message(message, self, 3200)
+
+    def award_relationship_exp(self, amount: int) -> RelationshipChange:
+        change = self.relationship_manager.add_exp(self.current_character_id(), amount)
+        self.show_relationship_feedback(change)
+        return change
+
+    def handle_collectible_unlock(self, result: UnlockResult) -> None:
+        if not result.unlocked or result.collectible is None:
+            self.refresh_growth_windows()
+            return
+        self.temporary_state("success", 3000)
+        self.refresh_growth_windows()
+        self.bubble.show_message(f"获得收藏品：{result.collectible.name}", self, 3200)
+
+    def handle_daily_check_in(self) -> None:
+        before = self.collection_manager.stats().get("last_login_date", "")
+        result = self.collection_manager.record_login()
+        after = self.collection_manager.stats().get("last_login_date", "")
+        if after != before:
+            self.award_relationship_exp(EXP_DAILY_CHECK_IN)
+        self.handle_collectible_unlock(result)
+
+    def on_report_generated_success(self) -> None:
+        self.award_relationship_exp(EXP_REPORT_SUCCESS)
+        self.handle_collectible_unlock(self.collection_manager.record_report_generated())
+
+    def on_chat_success(self) -> None:
+        self.award_relationship_exp(EXP_CHAT_SUCCESS)
+        self.handle_collectible_unlock(self.collection_manager.record_chat_success())
+
+    def open_relationship_panel(self) -> None:
+        if self.relationship_panel is None:
+            self.relationship_panel = RelationshipPanel(self.relationship_manager, self.open_collection_dialog, self)
+            self.register_attached_window(self.relationship_panel, "relationship")
+        self.relationship_panel.refresh(self.current_character)
+        self.relationship_panel.show()
+        self.position_attached_window(self.relationship_panel, force=True)
+        self.relationship_panel.raise_()
+        self.relationship_panel.activateWindow()
+
+    def open_collection_dialog(self) -> None:
+        if self.collection_dialog is None:
+            self.collection_dialog = CollectionDialog(self.collection_manager, self)
+            self.register_attached_window(self.collection_dialog, "collection")
+        self.collection_dialog.refresh()
+        self.collection_dialog.show()
+        self.position_attached_window(self.collection_dialog, force=True)
+        self.collection_dialog.raise_()
+        self.collection_dialog.activateWindow()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if event.type() in {
@@ -1699,7 +1946,7 @@ class KojiPet(QWidget):
         self.pomodoro_window.activateWindow()
 
     def open_settings_dialog(self) -> None:
-        self.settings_dialog = SettingsDialog(self.settings_manager, self.pomodoro_manager, self.tag_manager, self.notes_manager, self.character_manager, self)
+        self.settings_dialog = SettingsDialog(self.settings_manager, self.pomodoro_manager, self.tag_manager, self.notes_manager, self.character_manager, self.relationship_manager, self)
         self.register_attached_window(self.settings_dialog, "settings")
         self.settings_dialog.show()
         self.position_attached_window(self.settings_dialog, force=True)
@@ -1716,6 +1963,7 @@ class KojiPet(QWidget):
 
     def on_pomodoro_focus_completed(self) -> None:
         self.set_state("happy")
+        self.award_relationship_exp(EXP_POMODORO_DONE)
         prompt = QMessageBox(self)
         prompt.setWindowTitle("Koji")
         prompt.setText("本轮专注完成，要不要记录一下刚才推进了什么？")
@@ -1908,6 +2156,10 @@ class KojiPet(QWidget):
         chat.triggered.connect(self.open_chat_dialog)
         ai_report = QAction("AI 整理日报", self)
         ai_report.triggered.connect(self.ai_report_from_menu)
+        relationship_action = QAction("角色信息", self)
+        relationship_action.triggered.connect(self.open_relationship_panel)
+        collection_action = QAction("收藏柜", self)
+        collection_action.triggered.connect(self.open_collection_dialog)
         animation_action = QAction("关闭动画" if self.animations_enabled else "开启动画", self)
         animation_action.triggered.connect(self.toggle_animations)
         start_pomodoro = QAction("开始番茄钟", self)
@@ -1932,6 +2184,8 @@ class KojiPet(QWidget):
         menu.addAction(open_report)
         menu.addAction(chat)
         menu.addAction(ai_report)
+        menu.addAction(relationship_action)
+        menu.addAction(collection_action)
         menu.addSeparator()
         for action in (start_pomodoro, pause_pomodoro, stop_pomodoro, pomodoro_settings):
             menu.addAction(action)
@@ -1960,7 +2214,7 @@ class KojiPet(QWidget):
     def open_report_panel(self) -> None:
         self.temporary_state("idle")
         if self.report_panel is None:
-            self.report_panel = ReportPanel(self.report_manager, self.ai_runtime, self.category_manager, self.temporary_state, self)
+            self.report_panel = ReportPanel(self.report_manager, self.ai_runtime, self.category_manager, self.temporary_state, self.on_report_generated_success, self)
             self.register_attached_window(self.report_panel, "report")
         self.report_panel.refresh_ai_notice()
         self.report_panel.refresh_records()
@@ -1972,7 +2226,7 @@ class KojiPet(QWidget):
     def open_chat_dialog(self) -> None:
         self.temporary_state("success")
         if self.chat_dialog is None:
-            self.chat_dialog = ChatDialog(self.chat_manager, self)
+            self.chat_dialog = ChatDialog(self.chat_manager, self.on_chat_success, self)
             self.register_attached_window(self.chat_dialog, "chat")
         self.chat_dialog.refresh()
         self.chat_dialog.show()

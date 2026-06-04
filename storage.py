@@ -16,6 +16,8 @@ TAGS_FILE = DATA_DIR / "tags.json"
 CATEGORIES_FILE = DATA_DIR / "categories.json"
 POMODORO_STATS_FILE = DATA_DIR / "pomodoro_stats.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
+RELATIONSHIP_FILE = DATA_DIR / "relationship.json"
+COLLECTIBLES_FILE = DATA_DIR / "collectibles.json"
 
 
 def ensure_data_dir() -> None:
